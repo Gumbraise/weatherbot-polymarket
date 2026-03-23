@@ -282,7 +282,8 @@ async function takeForecastSnapshot(citySlug: string, dates: string[]) {
 
 // ── Core scan ────────────────────────────────────────────────────────────────
 
-export async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolved: number }> {
+export async function scanAndUpdate(options: { buyEnabled?: boolean } = {}): Promise<{ newPos: number; closed: number; resolved: number }> {
+  const { buyEnabled = true } = options;
   const now     = new Date();
   await syncBalance();
   let balance   = state.balance;
@@ -430,7 +431,7 @@ export async function scanAndUpdate(): Promise<{ newPos: number; closed: number;
       }
 
       // --- OPEN POSITION ---
-      if (!mkt.position && forecastTemp != null && hours >= MIN_HOURS) {
+      if (buyEnabled && !mkt.position && forecastTemp != null && hours >= MIN_HOURS) {
         const sigma = getSigma(citySlug, bestSource || "ecmwf");
         let bestSignal: Position | null = null;
 

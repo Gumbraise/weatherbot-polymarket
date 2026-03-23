@@ -18,12 +18,14 @@ import { initClobClient, getClobClient } from "./clob.js";
 import { syncBalance, getState, scanAndUpdate, monitorPositions, restorePositions, sellAllPositions, sleep } from "./engine.js";
 import { printStatus, printReport } from "./report.js";
 
-async function runLoop(): Promise<void> {
+async function runLoop(options: { buyEnabled?: boolean } = {}): Promise<void> {
+  const { buyEnabled = true } = options;
   await syncBalance();
 
   if (LIVE_TRADING) await initClobClient();
   const clobClient = getClobClient();
   const tradingMode = LIVE_TRADING && clobClient ? "LIVE" : "PAPER";
+  const modeLabel = buyEnabled ? tradingMode : `${tradingMode} MONITOR`;
 
   // Restore open positions from on-chain data
   if (LIVE_TRADING) {
@@ -36,9 +38,10 @@ async function runLoop(): Promise<void> {
   const state = getState();
 
   console.log(`\n${"=".repeat(55)}`);
-  console.log(`  WEATHERBET — STARTING (${tradingMode})`);
+  console.log(`  WEATHERBET — STARTING (${modeLabel})`);
   console.log(`${"=".repeat(55)}`);
-  console.log(`  Mode:       ${tradingMode}`);
+  console.log(`  Mode:       ${modeLabel}`);
+  if (!buyEnabled) console.log(`  Buy:        DISABLED (sell/exit only)`);
   console.log(`  Cities:     ${Object.keys(LOCATIONS).length}`);
   console.log(`  Balance:    $${state.balance.toFixed(2)} | Max bet: $${MAX_BET}`);
   console.log(`  Scan:       ${Math.floor(SCAN_INTERVAL / 60)} min | Monitor: ${Math.floor(MONITOR_INTERVAL / 60)} min`);
@@ -62,7 +65,7 @@ async function runLoop(): Promise<void> {
     if (nowTs - lastFullScan >= SCAN_INTERVAL) {
       console.log(`[${nowStr}] full scan...`);
       try {
-        const { newPos, closed, resolved } = await scanAndUpdate();
+        const { newPos, closed, resolved } = await scanAndUpdate({ buyEnabled });
         const st = getState();
         console.log(`  balance: $${st.balance.toFixed(2)} | new: ${newPos} | closed: ${closed} | resolved: ${resolved}`);
         lastFullScan = Date.now() / 1000;
@@ -129,6 +132,8 @@ async function exitAll(): Promise<void> {
 const cmd = process.argv[2] || "run";
 if (cmd === "run") {
   runLoop().catch(e => { console.error(e); process.exit(1); });
+} else if (cmd === "monitor") {
+  runLoop({ buyEnabled: false }).catch(e => { console.error(e); process.exit(1); });
 } else if (cmd === "exit" || cmd === "sell") {
   exitAll().catch(e => { console.error(e); process.exit(1); });
 } else if (cmd === "status") {
@@ -138,5 +143,5 @@ if (cmd === "run") {
   await syncBalance();
   printReport();
 } else {
-  console.log("Usage: tsx src/index.ts [run|status|report|exit]");
+  console.log("Usage: tsx src/index.ts [run|monitor|status|report|exit]");
 }

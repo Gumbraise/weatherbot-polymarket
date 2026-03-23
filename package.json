@@ -8,7 +8,8 @@
     "start": "tsx src/index.ts",
     "status": "tsx src/index.ts status",
     "report": "tsx src/index.ts report",
-    "exit": "tsx src/index.ts exit"
+    "exit": "tsx src/index.ts exit",
+    "monitor": "tsx src/index.ts monitor"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.0",
