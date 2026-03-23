@@ -3,11 +3,11 @@
   "version": "2.0.0",
   "type": "module",
   "description": "Weather Trading Bot for Polymarket — TypeScript",
-  "main": "bot_v2.ts",
+  "main": "src/index.ts",
   "scripts": {
-    "start": "tsx bot_v2.ts",
-    "status": "tsx bot_v2.ts status",
-    "report": "tsx bot_v2.ts report"
+    "start": "tsx src/index.ts",
+    "status": "tsx src/index.ts status",
+    "report": "tsx src/index.ts report"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.0",
