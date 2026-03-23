@@ -14,6 +14,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHmac } from "node:crypto";
 import axios from "axios";
 import "dotenv/config";
 
@@ -28,7 +29,7 @@ const env = (key: string, fallback: number): number => {
   return v !== undefined ? Number(v) : fallback;
 };
 
-const BALANCE         = env("BALANCE", 10000.0);
+const BALANCE_FALLBACK = env("BALANCE", 10000.0);
 const MAX_BET         = env("MAX_BET", 20.0);
 const MIN_EV          = env("MIN_EV", 0.10);
 const MAX_PRICE       = env("MAX_PRICE", 0.45);
@@ -40,6 +41,12 @@ const MAX_SLIPPAGE    = env("MAX_SLIPPAGE", 0.03);
 const SCAN_INTERVAL   = env("SCAN_INTERVAL", 3600);
 const CALIBRATION_MIN = env("CALIBRATION_MIN", 30);
 const VC_KEY          = process.env.VC_KEY ?? "";
+
+const CLOB_API_KEY    = process.env.CLOB_API_KEY ?? "";
+const CLOB_SECRET     = process.env.CLOB_SECRET ?? "";
+const CLOB_PASSPHRASE = process.env.CLOB_PASSPHRASE ?? "";
+const CLOB_ADDRESS    = process.env.CLOB_ADDRESS ?? "";
+const CLOB_BASE_URL   = "https://clob.polymarket.com";
 
 const SIGMA_F = 2.0;
 const SIGMA_C = 1.2;
@@ -306,6 +313,41 @@ function runCalibration(markets: Market[]): CalMap {
 }
 
 // =============================================================================
+// POLYMARKET BALANCE (CLOB API)
+// =============================================================================
+
+function clobSignature(timestamp: string, method: string, path: string, body = ""): string {
+  return createHmac("sha256", CLOB_SECRET)
+    .update(`${timestamp}${method}${path}${body}`)
+    .digest("base64");
+}
+
+async function fetchPolymarketBalance(): Promise<number | null> {
+  if (!CLOB_API_KEY || !CLOB_SECRET || !CLOB_PASSPHRASE || !CLOB_ADDRESS) return null;
+  const method = "GET";
+  const path   = "/balance-allowance";
+  const ts     = Math.floor(Date.now() / 1000).toString();
+  try {
+    const { data } = await axios.get(`${CLOB_BASE_URL}${path}`, {
+      params: { asset_type: "COLLATERAL" },
+      headers: {
+        "POLY_ADDRESS":    CLOB_ADDRESS,
+        "POLY_SIGNATURE":  clobSignature(ts, method, path),
+        "POLY_TIMESTAMP":  ts,
+        "POLY_API_KEY":    CLOB_API_KEY,
+        "POLY_PASSPHRASE": CLOB_PASSPHRASE,
+      },
+      timeout: 8000,
+    });
+    // Balance returned in wei (6 decimals for USDC)
+    return Number(data.balance) / 1e6;
+  } catch (e: any) {
+    console.log(`  [CLOB] Failed to fetch balance: ${e.message}`);
+    return null;
+  }
+}
+
+// =============================================================================
 // HELPERS
 // =============================================================================
 
@@ -562,13 +604,23 @@ function loadState(): State {
     return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
   }
   return {
-    balance:          BALANCE,
-    starting_balance: BALANCE,
+    balance:          BALANCE_FALLBACK,
+    starting_balance: BALANCE_FALLBACK,
     total_trades:     0,
     wins:             0,
     losses:           0,
-    peak_balance:     BALANCE,
+    peak_balance:     BALANCE_FALLBACK,
   };
+}
+
+async function syncBalance(state: State): Promise<void> {
+  const live = await fetchPolymarketBalance();
+  if (live != null) {
+    state.balance = round2(live);
+    if (state.starting_balance === BALANCE_FALLBACK) state.starting_balance = state.balance;
+    state.peak_balance = Math.max(state.peak_balance, state.balance);
+    console.log(`  [CLOB] Wallet balance: $${state.balance.toFixed(2)}`);
+  }
 }
 
 function saveState(state: State): void {
@@ -613,6 +665,7 @@ async function takeForecastSnapshot(citySlug: string, dates: string[]) {
 async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolved: number }> {
   const now     = new Date();
   const state   = loadState();
+  await syncBalance(state);
   let balance   = state.balance;
   let newPos    = 0;
   let closed    = 0;
@@ -1105,12 +1158,15 @@ async function monitorPositions(): Promise<number> {
 
 async function runLoop(): Promise<void> {
   _cal = loadCal();
+  const state = loadState();
+  await syncBalance(state);
+  saveState(state);
 
   console.log(`\n${"=".repeat(55)}`);
   console.log(`  WEATHERBET — STARTING`);
   console.log(`${"=".repeat(55)}`);
   console.log(`  Cities:     ${Object.keys(LOCATIONS).length}`);
-  console.log(`  Balance:    $${BALANCE.toFixed(0)} | Max bet: $${MAX_BET}`);
+  console.log(`  Balance:    $${state.balance.toFixed(2)} | Max bet: $${MAX_BET}`);
   console.log(`  Scan:       ${Math.floor(SCAN_INTERVAL / 60)} min | Monitor: ${Math.floor(MONITOR_INTERVAL / 60)} min`);
   console.log(`  Sources:    ECMWF + HRRR(US) + METAR(D+0)`);
   console.log(`  Data:       ${resolve(DATA_DIR)}`);
