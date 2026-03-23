@@ -15,7 +15,7 @@ import {
   LOCATIONS, MAX_BET, SCAN_INTERVAL, MONITOR_INTERVAL, LIVE_TRADING,
 } from "./config.js";
 import { initClobClient, getClobClient } from "./clob.js";
-import { syncBalance, getState, scanAndUpdate, monitorPositions, restorePositions, sleep } from "./engine.js";
+import { syncBalance, getState, scanAndUpdate, monitorPositions, restorePositions, sellAllPositions, sleep } from "./engine.js";
 import { printStatus, printReport } from "./report.js";
 
 async function runLoop(): Promise<void> {
@@ -93,11 +93,44 @@ async function runLoop(): Promise<void> {
   }
 }
 
+async function exitAll(): Promise<void> {
+  await syncBalance();
+  if (!LIVE_TRADING) {
+    console.log("  LIVE_TRADING is disabled — nothing to sell");
+    return;
+  }
+  await initClobClient();
+  if (!getClobClient()) {
+    console.log("  CLOB client failed — cannot sell");
+    return;
+  }
+
+  console.log(`\n${"=".repeat(55)}`);
+  console.log(`  WEATHERBET — EXIT ALL POSITIONS`);
+  console.log(`${"=".repeat(55)}\n`);
+
+  console.log(`  Scanning on-chain positions...`);
+  const restored = await restorePositions();
+  if (restored === 0) {
+    console.log(`  No active positions found. Nothing to sell.`);
+    return;
+  }
+  console.log(`  Found ${restored} position(s) — selling all...\n`);
+
+  const sold = await sellAllPositions();
+  const st = getState();
+  console.log(`\n  Sold: ${sold} position(s)`);
+  console.log(`  Balance: $${st.balance.toFixed(2)}`);
+  console.log(`${"=".repeat(55)}\n`);
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 const cmd = process.argv[2] || "run";
 if (cmd === "run") {
   runLoop().catch(e => { console.error(e); process.exit(1); });
+} else if (cmd === "exit" || cmd === "sell") {
+  exitAll().catch(e => { console.error(e); process.exit(1); });
 } else if (cmd === "status") {
   await syncBalance();
   printStatus();
@@ -105,5 +138,5 @@ if (cmd === "run") {
   await syncBalance();
   printReport();
 } else {
-  console.log("Usage: tsx src/index.ts [run|status|report]");
+  console.log("Usage: tsx src/index.ts [run|status|report|exit]");
 }

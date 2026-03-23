@@ -184,6 +184,69 @@ export async function restorePositions(): Promise<number> {
   return restored;
 }
 
+// ── Sell all positions ───────────────────────────────────────────────────────
+
+/**
+ * Sell/exit ALL open positions at current market price.
+ * Used when the user wants to close everything and stop.
+ */
+export async function sellAllPositions(): Promise<number> {
+  const openPos = getAllMarkets().filter(m => m.position?.status === "open");
+  if (openPos.length === 0) return 0;
+
+  const clobClient = getClobClient();
+  let sold = 0;
+
+  for (const mkt of openPos) {
+    const pos = mkt.position!;
+    const cityName = LOCATIONS[mkt.city]?.name || mkt.city;
+    const unitSym = mkt.unit === "F" ? "F" : "C";
+    const label = `${pos.bucket_low}-${pos.bucket_high}${unitSym}`;
+
+    // Get current bid price
+    let currentPrice: number | null = null;
+    try {
+      const { data: mdata } = await axios.get(
+        `https://gamma-api.polymarket.com/markets/${pos.market_id}`,
+        { timeout: 5000 }
+      );
+      if (mdata.bestBid != null) currentPrice = Number(mdata.bestBid);
+    } catch { /* ignore */ }
+
+    if (currentPrice == null) currentPrice = pos.entry_price * 0.90;
+
+    if (LIVE_TRADING && clobClient && pos.token_id) {
+      const orderId = await placeLiveOrder(
+        pos.token_id, "SELL", currentPrice, pos.shares,
+        pos.tick_size || "0.01", pos.neg_risk || false,
+      );
+      if (!orderId) {
+        console.log(`  [EXIT FAILED] ${cityName} ${mkt.date} | ${label}`);
+        continue;
+      }
+    }
+
+    const pnl = round2((currentPrice - pos.entry_price) * pos.shares);
+    pos.exit_price   = currentPrice;
+    pos.pnl          = pnl;
+    pos.close_reason = "manual_exit";
+    pos.closed_at    = new Date().toISOString();
+    pos.status       = "closed";
+    mkt.status       = "closed";
+    setMarket(mkt);
+    sold++;
+
+    console.log(
+      `  [EXIT] ${cityName} ${mkt.date} | ${label} | ` +
+      `${pos.shares.toFixed(2)} shares @ $${currentPrice.toFixed(3)} | ` +
+      `PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`
+    );
+    await sleep(300);
+  }
+
+  return sold;
+}
+
 // ── Forecast snapshot ────────────────────────────────────────────────────────
 
 async function takeForecastSnapshot(citySlug: string, dates: string[]) {
