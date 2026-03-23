@@ -15,7 +15,7 @@ import {
   LOCATIONS, MAX_BET, SCAN_INTERVAL, MONITOR_INTERVAL, LIVE_TRADING,
 } from "./config.js";
 import { initClobClient, getClobClient } from "./clob.js";
-import { syncBalance, getState, scanAndUpdate, monitorPositions, sleep } from "./engine.js";
+import { syncBalance, getState, scanAndUpdate, monitorPositions, restorePositions, sleep } from "./engine.js";
 import { printStatus, printReport } from "./report.js";
 
 async function runLoop(): Promise<void> {
@@ -24,6 +24,15 @@ async function runLoop(): Promise<void> {
   if (LIVE_TRADING) await initClobClient();
   const clobClient = getClobClient();
   const tradingMode = LIVE_TRADING && clobClient ? "LIVE" : "PAPER";
+
+  // Restore open positions from on-chain data
+  if (LIVE_TRADING) {
+    console.log(`  [RESTORE] Scanning on-chain positions...`);
+    const restored = await restorePositions();
+    if (restored > 0) console.log(`  [RESTORE] Found ${restored} active position(s)`);
+    else console.log(`  [RESTORE] No active positions found`);
+  }
+
   const state = getState();
 
   console.log(`\n${"=".repeat(55)}`);

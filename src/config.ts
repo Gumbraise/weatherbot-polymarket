@@ -25,6 +25,8 @@ export const PRIVATE_KEY     = process.env.PRIVATE_KEY ?? "";
 export const LIVE_TRADING    = (process.env.LIVE_TRADING ?? "false").toLowerCase() === "true";
 export const CLOB_HOST       = "https://clob.polymarket.com";
 export const USDC_CONTRACT   = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+// Polymarket Conditional Token Framework (ERC-1155) on Polygon
+export const CTF_CONTRACT    = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 
 export const SIGMA_F = 2.0;
 export const SIGMA_C = 1.2;

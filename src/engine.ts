@@ -8,7 +8,7 @@ import {
 import { round2, round4, bucketProb, calcEv, calcKelly, betSize, inBucket, getSigma } from "./math.js";
 import { getEcmwf, getHrrr, getMetar, getActualTemp } from "./forecast.js";
 import { getPolymarketEvent, parseOutcomes, hoursToResolution, checkMarketResolved } from "./polymarket.js";
-import { fetchPolymarketBalance } from "./wallet.js";
+import { fetchPolymarketBalance, getTokenBalance } from "./wallet.js";
 import { getClobClient, placeLiveOrder, hasExistingOrders } from "./clob.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -84,6 +84,104 @@ export async function syncBalance(): Promise<void> {
     state.peak_balance = Math.max(state.peak_balance, state.balance);
     console.log(`  [WALLET] Balance: $${state.balance.toFixed(2)}`);
   }
+}
+
+// ── Restore positions from on-chain data ─────────────────────────────────────
+
+/**
+ * At startup, scan all weather markets and check on-chain CTF balances
+ * to reconstruct any open positions from a previous run.
+ */
+export async function restorePositions(): Promise<number> {
+  const now = new Date();
+  let restored = 0;
+
+  for (const [citySlug, loc] of Object.entries(LOCATIONS)) {
+    const dates: string[] = [];
+    for (let i = 0; i < 4; i++) dates.push(formatDate(addDays(now, i)));
+
+    for (const date of dates) {
+      // Skip if already tracked in memory
+      if (getMarket(`${citySlug}_${date}`) != null) continue;
+
+      const dt = new Date(date + "T00:00:00Z");
+      const event = await getPolymarketEvent(
+        citySlug, MONTHS[dt.getUTCMonth()], dt.getUTCDate(), dt.getUTCFullYear()
+      );
+      if (!event) continue;
+
+      const outcomes = parseOutcomes(event.markets || []);
+
+      for (const o of outcomes) {
+        if (!o.token_id) continue;
+        const shares = await getTokenBalance(o.token_id);
+        if (shares < 0.01) continue;
+
+        // We hold shares on this token — reconstruct position
+        const endDate = event.endDate || "";
+        const hours = endDate ? hoursToResolution(endDate) : 0;
+
+        const mkt: Market = {
+          city:               citySlug,
+          city_name:          loc.name,
+          date,
+          unit:               loc.unit,
+          station:            loc.station,
+          event_end_date:     endDate,
+          hours_at_discovery: Math.round(hours * 10) / 10,
+          status:             "open",
+          position:           null,
+          actual_temp:        null,
+          resolved_outcome:   null,
+          pnl:                null,
+          forecast_snapshots: [],
+          market_snapshots:   [],
+          all_outcomes:       outcomes,
+          created_at:         new Date().toISOString(),
+        };
+
+        // Use current market price as estimated entry (conservative)
+        const entryPrice = o.price || o.bid || 0.50;
+        mkt.position = {
+          market_id:     o.market_id,
+          token_id:      o.token_id,
+          question:      o.question,
+          bucket_low:    o.range[0],
+          bucket_high:   o.range[1],
+          entry_price:   entryPrice,
+          bid_at_entry:  o.bid,
+          spread:        o.spread,
+          shares:        round2(shares),
+          cost:          round2(shares * entryPrice),
+          p:             0,
+          ev:            0,
+          kelly:         0,
+          forecast_temp: 0,
+          forecast_src:  null,
+          sigma:         0,
+          opened_at:     new Date().toISOString(),
+          status:        "open",
+          pnl:           null,
+          exit_price:    null,
+          close_reason:  null,
+          closed_at:     null,
+          neg_risk:      o.neg_risk,
+          tick_size:     o.tick_size,
+        };
+
+        setMarket(mkt);
+        restored++;
+        const unitSym = loc.unit === "F" ? "F" : "C";
+        const label = `${o.range[0]}-${o.range[1]}${unitSym}`;
+        console.log(`  [RESTORE] ${loc.name} ${date} | ${label} | ${shares.toFixed(2)} shares @ ~$${entryPrice.toFixed(3)}`);
+        break; // one position per market date
+      }
+
+      await sleep(100);
+    }
+  }
+
+  return restored;
 }
 
 // ── Forecast snapshot ────────────────────────────────────────────────────────
