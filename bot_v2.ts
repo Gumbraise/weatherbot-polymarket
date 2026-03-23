@@ -887,6 +887,15 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
     const won = await checkMarketResolved(pos.market_id);
     if (won === null) continue;
 
+    // Fetch actual temperature for calibration
+    if (VC_KEY && mkt.actual_temp == null) {
+      const actual = await getActualTemp(mkt.city, mkt.date);
+      if (actual != null) {
+        mkt.actual_temp = actual;
+        console.log(`  [VC] ${mkt.city_name} ${mkt.date} actual: ${actual}°${mkt.unit}`);
+      }
+    }
+
     const pnl = won ? round2(pos.shares * (1 - pos.entry_price)) : round2(-pos.cost);
 
     balance += pos.cost + pnl;
