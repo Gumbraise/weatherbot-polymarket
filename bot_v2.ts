@@ -995,6 +995,19 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
           }
 
           if (!skipPosition && bestSignal.entry_price < MAX_PRICE) {
+            // Guard against duplicate orders if local data was lost
+            if (LIVE_TRADING && clobClient && bestSignal.token_id) {
+              try {
+                const existing = await clobClient.getOpenOrders({ asset_id: bestSignal.token_id });
+                const orders = Array.isArray(existing) ? existing : (existing as any)?.data ?? [];
+                if (orders.length > 0) {
+                  console.log(`  [SKIP] ${loc.name} ${date} — already have ${orders.length} open order(s) on this token`);
+                  saveMarket(mkt);
+                  await sleep(100);
+                  continue;
+                }
+              } catch { /* ignore check failure, proceed with order */ }
+            }
             if (LIVE_TRADING && clobClient) {
               const orderId = await placeLiveOrder(
                 bestSignal.token_id || "", "BUY",
