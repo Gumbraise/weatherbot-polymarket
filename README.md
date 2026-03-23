@@ -65,7 +65,7 @@ src/
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/weatherbot-polymarket.git
+git clone https://github.com/Gumbraise/weatherbot-polymarket.git
 cd weatherbot-polymarket
 npm install
 ```
