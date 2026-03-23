@@ -465,19 +465,6 @@ async function getPolymarketEvent(citySlug: string, month: string, day: number, 
   return null;
 }
 
-async function getMarketPrice(marketId: string): Promise<number | null> {
-  try {
-    const { data } = await axios.get(
-      `https://gamma-api.polymarket.com/markets/${marketId}`,
-      { timeout: 5000 }
-    );
-    const prices = JSON.parse(data.outcomePrices || "[0.5,0.5]");
-    return Number(prices[0]);
-  } catch {
-    return null;
-  }
-}
-
 function parseTempRange(question: string): [number, number] | null {
   if (!question) return null;
   const num = "(-?\\d+(?:\\.\\d+)?)";
