@@ -357,9 +357,26 @@ async function initClobClient(): Promise<void> {
   }
   try {
     const signer = new Wallet(PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : `0x${PRIVATE_KEY}`);
-    const tempClient = new ClobClient(CLOB_HOST, 137, signer);
-    const creds: ApiKeyCreds = await tempClient.createOrDeriveApiKey();
-    clobClient = new ClobClient(CLOB_HOST, 137, signer, creds, 0, POLY_WALLET || undefined);
+
+    // Use existing CLOB creds from .env if available, otherwise derive
+    const envKey = process.env.CLOB_API_KEY ?? "";
+    const envSecret = process.env.CLOB_SECRET ?? "";
+    const envPassphrase = process.env.CLOB_PASSPHRASE ?? "";
+
+    let creds: ApiKeyCreds;
+    if (envKey && envSecret && envPassphrase) {
+      creds = { key: envKey, secret: envSecret, passphrase: envPassphrase };
+      console.log(`  [LIVE] Using CLOB creds from .env`);
+    } else {
+      const tempClient = new ClobClient(CLOB_HOST, 137, signer);
+      creds = await tempClient.createOrDeriveApiKey();
+      console.log(`  [LIVE] Derived CLOB creds (save them to .env to avoid this step)`);
+      console.log(`  CLOB_API_KEY=${creds.key}`);
+      console.log(`  CLOB_SECRET=${creds.secret}`);
+      console.log(`  CLOB_PASSPHRASE=${creds.passphrase}`);
+    }
+
+    clobClient = new ClobClient(CLOB_HOST, 137, signer, creds, 2, POLY_WALLET || undefined);
     console.log(`  [LIVE] CLOB client ready — signer ${signer.address}`);
   } catch (e: any) {
     console.log(`  [LIVE] CLOB init failed: ${e.message} — falling back to paper trading`);
@@ -382,18 +399,31 @@ async function placeLiveOrder(
   negRisk: boolean,
 ): Promise<string | null> {
   if (!clobClient || !tokenId) return null;
+  // CLOB minimum order size is $1 for marketable BUY orders
+  const adjustedSize = side === "BUY" && size * price < 1.0
+    ? Math.ceil(1.0 / price * 100) / 100
+    : size;
   try {
     const resp = await clobClient.createAndPostOrder(
       {
         tokenID: tokenId,
         price,
         side: side === "BUY" ? Side.BUY : Side.SELL,
-        size,
+        size: adjustedSize,
       },
       { tickSize: toTickSize(tickSize), negRisk },
       OrderType.GTC,
     );
-    const orderId = (resp as any)?.orderID ?? (resp as any)?.id ?? "submitted";
+    const r = resp as any;
+    if (r?.error || r?.status === 401 || r?.status === 400) {
+      console.log(`  [LIVE ${side} FAILED] ${r.error ?? r.data?.error ?? JSON.stringify(r)}`);
+      return null;
+    }
+    const orderId = r?.orderID ?? r?.id ?? null;
+    if (!orderId) {
+      console.log(`  [LIVE ${side} FAILED] No orderID in response: ${JSON.stringify(r)}`);
+      return null;
+    }
     console.log(`  [LIVE ${side}] Order ${orderId}`);
     return String(orderId);
   } catch (e: any) {
