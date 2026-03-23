@@ -14,7 +14,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHmac } from "node:crypto";
 import axios from "axios";
 import "dotenv/config";
 
@@ -42,11 +41,10 @@ const SCAN_INTERVAL   = env("SCAN_INTERVAL", 3600);
 const CALIBRATION_MIN = env("CALIBRATION_MIN", 30);
 const VC_KEY          = process.env.VC_KEY ?? "";
 
-const CLOB_API_KEY    = process.env.CLOB_API_KEY ?? "";
-const CLOB_SECRET     = process.env.CLOB_SECRET ?? "";
-const CLOB_PASSPHRASE = process.env.CLOB_PASSPHRASE ?? "";
-const CLOB_ADDRESS    = process.env.CLOB_ADDRESS ?? "";
-const CLOB_BASE_URL   = "https://clob.polymarket.com";
+const POLY_WALLET     = process.env.POLY_WALLET ?? "";
+const POLYGON_RPC     = process.env.POLYGON_RPC ?? "https://polygon-bor-rpc.publicnode.com";
+// USDC.e on Polygon (used by Polymarket)
+const USDC_CONTRACT   = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 const SIGMA_F = 2.0;
 const SIGMA_C = 1.2;
@@ -313,36 +311,23 @@ function runCalibration(markets: Market[]): CalMap {
 }
 
 // =============================================================================
-// POLYMARKET BALANCE (CLOB API)
+// POLYMARKET BALANCE (Polygon USDC.e via RPC)
 // =============================================================================
 
-function clobSignature(timestamp: string, method: string, path: string, body = ""): string {
-  return createHmac("sha256", CLOB_SECRET)
-    .update(`${timestamp}${method}${path}${body}`)
-    .digest("base64");
-}
-
 async function fetchPolymarketBalance(): Promise<number | null> {
-  if (!CLOB_API_KEY || !CLOB_SECRET || !CLOB_PASSPHRASE || !CLOB_ADDRESS) return null;
-  const method = "GET";
-  const path   = "/balance-allowance";
-  const ts     = Math.floor(Date.now() / 1000).toString();
+  if (!POLY_WALLET) return null;
+  // balanceOf(address) selector = 0x70a08231, address padded to 32 bytes
+  const addr = POLY_WALLET.replace("0x", "").toLowerCase().padStart(64, "0");
+  const callData = `0x70a08231${addr}`;
   try {
-    const { data } = await axios.get(`${CLOB_BASE_URL}${path}`, {
-      params: { asset_type: "COLLATERAL" },
-      headers: {
-        "POLY_ADDRESS":    CLOB_ADDRESS,
-        "POLY_SIGNATURE":  clobSignature(ts, method, path),
-        "POLY_TIMESTAMP":  ts,
-        "POLY_API_KEY":    CLOB_API_KEY,
-        "POLY_PASSPHRASE": CLOB_PASSPHRASE,
-      },
-      timeout: 8000,
-    });
-    // Balance returned in wei (6 decimals for USDC)
-    return Number(data.balance) / 1e6;
+    const { data } = await axios.post(POLYGON_RPC, {
+      jsonrpc: "2.0", id: 1, method: "eth_call",
+      params: [{ to: USDC_CONTRACT, data: callData }, "latest"],
+    }, { timeout: 8000 });
+    // USDC.e has 6 decimals
+    return parseInt(data.result, 16) / 1e6;
   } catch (e: any) {
-    console.log(`  [CLOB] Failed to fetch balance: ${e.message}`);
+    console.log(`  [RPC] Failed to fetch balance: ${e.message}`);
     return null;
   }
 }
@@ -619,7 +604,7 @@ async function syncBalance(state: State): Promise<void> {
     state.balance = round2(live);
     if (state.starting_balance === BALANCE_FALLBACK) state.starting_balance = state.balance;
     state.peak_balance = Math.max(state.peak_balance, state.balance);
-    console.log(`  [CLOB] Wallet balance: $${state.balance.toFixed(2)}`);
+    console.log(`  [WALLET] Balance: $${state.balance.toFixed(2)}`);
   }
 }
 
