@@ -16,6 +16,9 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import axios from "axios";
 import "dotenv/config";
+import { Wallet } from "ethers";
+import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
+import type { ApiKeyCreds, TickSize } from "@polymarket/clob-client";
 
 // =============================================================================
 // CONFIG
@@ -43,6 +46,9 @@ const VC_KEY          = process.env.VC_KEY ?? "";
 
 const POLY_WALLET     = process.env.POLY_WALLET ?? "";
 const POLYGON_RPC     = process.env.POLYGON_RPC ?? "https://polygon-bor-rpc.publicnode.com";
+const PRIVATE_KEY     = process.env.PRIVATE_KEY ?? "";
+const LIVE_TRADING    = (process.env.LIVE_TRADING ?? "false").toLowerCase() === "true";
+const CLOB_HOST       = "https://clob.polymarket.com";
 // USDC.e on Polygon (used by Polymarket)
 const USDC_CONTRACT   = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
@@ -73,6 +79,7 @@ interface Location {
 
 interface Position {
   market_id: string;
+  token_id?: string;
   question: string;
   bucket_low: number;
   bucket_high: number;
@@ -95,17 +102,22 @@ interface Position {
   closed_at: string | null;
   stop_price?: number;
   trailing_activated?: boolean;
+  neg_risk?: boolean;
+  tick_size?: string;
 }
 
 interface Outcome {
   question: string;
   market_id: string;
+  token_id: string;
   range: [number, number];
   bid: number;
   ask: number;
   price: number;
   spread: number;
   volume: number;
+  neg_risk: boolean;
+  tick_size: string;
 }
 
 interface ForecastSnap {
@@ -328,6 +340,64 @@ async function fetchPolymarketBalance(): Promise<number | null> {
     return parseInt(data.result, 16) / 1e6;
   } catch (e: any) {
     console.log(`  [RPC] Failed to fetch balance: ${e.message}`);
+    return null;
+  }
+}
+
+// =============================================================================
+// CLOB CLIENT (live trading)
+// =============================================================================
+
+let clobClient: ClobClient | null = null;
+
+async function initClobClient(): Promise<void> {
+  if (!LIVE_TRADING || !PRIVATE_KEY) {
+    if (LIVE_TRADING) console.log("  [LIVE] PRIVATE_KEY missing — falling back to paper trading");
+    return;
+  }
+  try {
+    const signer = new Wallet(PRIVATE_KEY.startsWith("0x") ? PRIVATE_KEY : `0x${PRIVATE_KEY}`);
+    const tempClient = new ClobClient(CLOB_HOST, 137, signer);
+    const creds: ApiKeyCreds = await tempClient.createOrDeriveApiKey();
+    clobClient = new ClobClient(CLOB_HOST, 137, signer, creds, 0, POLY_WALLET || undefined);
+    console.log(`  [LIVE] CLOB client ready — signer ${signer.address}`);
+  } catch (e: any) {
+    console.log(`  [LIVE] CLOB init failed: ${e.message} — falling back to paper trading`);
+    clobClient = null;
+  }
+}
+
+const VALID_TICK_SIZES = new Set(["0.1", "0.01", "0.001", "0.0001"]);
+
+function toTickSize(s: string): TickSize {
+  return VALID_TICK_SIZES.has(s) ? (s as TickSize) : "0.01";
+}
+
+async function placeLiveOrder(
+  tokenId: string,
+  side: "BUY" | "SELL",
+  price: number,
+  size: number,
+  tickSize: string,
+  negRisk: boolean,
+): Promise<string | null> {
+  if (!clobClient || !tokenId) return null;
+  try {
+    const resp = await clobClient.createAndPostOrder(
+      {
+        tokenID: tokenId,
+        price,
+        side: side === "BUY" ? Side.BUY : Side.SELL,
+        size,
+      },
+      { tickSize: toTickSize(tickSize), negRisk },
+      OrderType.GTC,
+    );
+    const orderId = (resp as any)?.orderID ?? (resp as any)?.id ?? "submitted";
+    console.log(`  [LIVE ${side}] Order ${orderId}`);
+    return String(orderId);
+  } catch (e: any) {
+    console.log(`  [LIVE ${side} FAILED] ${e.message}`);
     return null;
   }
 }
@@ -706,10 +776,17 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
           bid = Number(prices[0]);
           ask = prices.length > 1 ? Number(prices[1]) : bid;
         } catch { continue; }
+        let tokenId = "";
+        try {
+          const tokenIds = JSON.parse(market.clobTokenIds || "[]");
+          tokenId = tokenIds[0] || "";
+        } catch { /* ignore */ }
         outcomes.push({
-          question, market_id: mid, range: rng,
+          question, market_id: mid, token_id: tokenId, range: rng,
           bid: round4(bid), ask: round4(ask), price: round4(bid),
           spread: round4(ask - bid), volume: Math.round(volume),
+          neg_risk: !!market.negRisk,
+          tick_size: String(market.orderPriceMinTickSize || "0.01"),
         });
       }
 
@@ -765,6 +842,9 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
           }
 
           if (currentPrice <= stop) {
+            if (LIVE_TRADING && clobClient && pos.token_id) {
+              await placeLiveOrder(pos.token_id, "SELL", currentPrice, pos.shares, pos.tick_size || "0.01", pos.neg_risk || false);
+            }
             const pnl = round2((currentPrice - entry) * pos.shares);
             balance += pos.cost + pnl;
             pos.closed_at    = snap.ts ?? null;
@@ -793,6 +873,9 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
             if (o.market_id === pos.market_id) { currentPrice = o.price; break; }
           }
           if (currentPrice != null) {
+            if (LIVE_TRADING && clobClient && pos.token_id) {
+              await placeLiveOrder(pos.token_id, "SELL", currentPrice, pos.shares, pos.tick_size || "0.01", pos.neg_risk || false);
+            }
             const pnl = round2((currentPrice - pos.entry_price) * pos.shares);
             balance += pos.cost + pnl;
             mkt.position.closed_at    = snap.ts ?? null;
@@ -828,6 +911,7 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
               if (size >= 0.50) {
                 bestSignal = {
                   market_id:     o.market_id,
+                  token_id:      o.token_id,
                   question:      o.question,
                   bucket_low:    tLow,
                   bucket_high:   tHigh,
@@ -848,6 +932,8 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
                   exit_price:    null,
                   close_reason:  null,
                   closed_at:     null,
+                  neg_risk:      o.neg_risk,
+                  tick_size:     o.tick_size,
                 };
               }
             }
@@ -879,13 +965,27 @@ async function scanAndUpdate(): Promise<{ newPos: number; closed: number; resolv
           }
 
           if (!skipPosition && bestSignal.entry_price < MAX_PRICE) {
+            if (LIVE_TRADING && clobClient) {
+              const orderId = await placeLiveOrder(
+                bestSignal.token_id || "", "BUY",
+                bestSignal.entry_price, bestSignal.shares,
+                bestSignal.tick_size || "0.01", bestSignal.neg_risk || false,
+              );
+              if (!orderId) {
+                console.log(`  [SKIP] ${loc.name} ${date} — live order failed, skipping`);
+                saveMarket(mkt);
+                await sleep(100);
+                continue;
+              }
+            }
             balance -= bestSignal.cost;
             mkt.position = bestSignal;
             state.total_trades += 1;
             newPos += 1;
             const bucketLabel = `${bestSignal.bucket_low}-${bestSignal.bucket_high}${unitSym}`;
+            const mode = LIVE_TRADING && clobClient ? "LIVE BUY" : "BUY";
             console.log(
-              `  [BUY]  ${loc.name} ${horizon} ${date} | ${bucketLabel} | ` +
+              `  [${mode}]  ${loc.name} ${horizon} ${date} | ${bucketLabel} | ` +
               `$${bestSignal.entry_price.toFixed(3)} | EV ${bestSignal.ev >= 0 ? "+" : ""}${bestSignal.ev.toFixed(2)} | ` +
               `$${bestSignal.cost.toFixed(2)} (${(bestSignal.forecast_src || "").toUpperCase()})`
             );
@@ -1113,6 +1213,9 @@ async function monitorPositions(): Promise<number> {
     const stopTriggered = currentPrice <= stop;
 
     if (takeTriggered || stopTriggered) {
+      if (LIVE_TRADING && clobClient && pos.token_id) {
+        await placeLiveOrder(pos.token_id, "SELL", currentPrice, pos.shares, pos.tick_size || "0.01", pos.neg_risk || false);
+      }
       const pnl = round2((currentPrice - entry) * pos.shares);
       balance += pos.cost + pnl;
       pos.closed_at = new Date().toISOString();
@@ -1147,9 +1250,13 @@ async function runLoop(): Promise<void> {
   await syncBalance(state);
   saveState(state);
 
+  if (LIVE_TRADING) await initClobClient();
+  const tradingMode = LIVE_TRADING && clobClient ? "LIVE" : "PAPER";
+
   console.log(`\n${"=".repeat(55)}`);
-  console.log(`  WEATHERBET — STARTING`);
+  console.log(`  WEATHERBET — STARTING (${tradingMode})`);
   console.log(`${"=".repeat(55)}`);
+  console.log(`  Mode:       ${tradingMode}`);
   console.log(`  Cities:     ${Object.keys(LOCATIONS).length}`);
   console.log(`  Balance:    $${state.balance.toFixed(2)} | Max bet: $${MAX_BET}`);
   console.log(`  Scan:       ${Math.floor(SCAN_INTERVAL / 60)} min | Monitor: ${Math.floor(MONITOR_INTERVAL / 60)} min`);
