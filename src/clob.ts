@@ -1,7 +1,7 @@
 import { Wallet } from "ethers";
-import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
-import type { ApiKeyCreds, TickSize } from "@polymarket/clob-client";
-import { CLOB_HOST, PRIVATE_KEY, LIVE_TRADING, POLY_WALLET } from "./config.js";
+import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
+import type { ApiKeyCreds, OpenOrder, TickSize, Trade } from "@polymarket/clob-client";
+import { CLOB_HOST, LIVE_TRADING, POLY_WALLET, PRIVATE_KEY } from "./config.js";
 
 let clobClient: ClobClient | null = null;
 
@@ -48,53 +48,116 @@ function toTickSize(s: string): TickSize {
   return VALID_TICK_SIZES.has(s) ? (s as TickSize) : "0.01";
 }
 
-export async function placeLiveOrder(
-  tokenId: string,
-  side: "BUY" | "SELL",
-  price: number,
-  size: number,
-  tickSize: string,
-  negRisk: boolean,
-): Promise<string | null> {
-  if (!clobClient || !tokenId) return null;
-  const adjustedSize = side === "BUY" && size * price < 1.0
-    ? Math.ceil(1.0 / price * 100) / 100
-    : size;
+export interface ExchangeOrderRequest {
+  tokenId: string;
+  side: "BUY" | "SELL";
+  amount: number;
+  limitPrice: number | null;
+  tickSize: string;
+  negRisk: boolean;
+}
+
+export interface ExchangeOrderSubmission {
+  orderId: string;
+  status: string | null;
+  makingAmount: number | null;
+  takingAmount: number | null;
+  transactionHashes: string[];
+  raw: unknown;
+}
+
+export async function submitImmediateOrder(request: ExchangeOrderRequest): Promise<ExchangeOrderSubmission | null> {
+  if (!clobClient || !request.tokenId) return null;
   try {
-    const resp = await clobClient.createAndPostOrder(
+    const resp = await clobClient.createAndPostMarketOrder(
       {
-        tokenID: tokenId,
-        price,
-        side: side === "BUY" ? Side.BUY : Side.SELL,
-        size: adjustedSize,
+        tokenID: request.tokenId,
+        amount: request.amount,
+        side: request.side === "BUY" ? Side.BUY : Side.SELL,
+        price: request.limitPrice ?? undefined,
       },
-      { tickSize: toTickSize(tickSize), negRisk },
-      OrderType.GTC,
+      { tickSize: toTickSize(request.tickSize), negRisk: request.negRisk },
+      OrderType.FAK,
     );
     const r = resp as any;
     if (r?.error || r?.status === 401 || r?.status === 400) {
-      console.log(`  [LIVE ${side} FAILED] ${r.error ?? r.data?.error ?? JSON.stringify(r)}`);
+      console.log(`  [LIVE ${request.side} FAILED] ${r.error ?? r.data?.error ?? JSON.stringify(r)}`);
       return null;
     }
     const orderId = r?.orderID ?? r?.id ?? null;
     if (!orderId) {
-      console.log(`  [LIVE ${side} FAILED] No orderID in response: ${JSON.stringify(r)}`);
+      console.log(`  [LIVE ${request.side} FAILED] No orderID in response: ${JSON.stringify(r)}`);
       return null;
     }
-    console.log(`  [LIVE ${side}] Order ${orderId}`);
-    return String(orderId);
+    return {
+      orderId: String(orderId),
+      status: typeof r?.status === "string" ? r.status : null,
+      makingAmount: r?.makingAmount != null ? Number(r.makingAmount) : null,
+      takingAmount: r?.takingAmount != null ? Number(r.takingAmount) : null,
+      transactionHashes: Array.isArray(r?.transactionsHashes) ? r.transactionsHashes.map(String) : [],
+      raw: r,
+    };
   } catch (e: any) {
-    console.log(`  [LIVE ${side} FAILED] ${e.message}`);
+    console.log(`  [LIVE ${request.side} FAILED] ${e.message}`);
     return null;
   }
 }
 
-export async function hasExistingOrders(tokenId: string): Promise<boolean> {
-  if (!clobClient || !tokenId) return false;
+export async function fetchOpenOrders(tokenId?: string): Promise<OpenOrder[]> {
+  if (!clobClient) return [];
   try {
-    const existing = await clobClient.getOpenOrders({ asset_id: tokenId });
-    const orders = Array.isArray(existing) ? existing : (existing as any)?.data ?? [];
-    return orders.length > 0;
+    const existing = tokenId
+      ? await clobClient.getOpenOrders({ asset_id: tokenId }, true)
+      : await clobClient.getOpenOrders(undefined, true);
+    return Array.isArray(existing) ? existing : (existing as any)?.data ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchOrder(orderId: string): Promise<OpenOrder | null> {
+  if (!clobClient || !orderId) return null;
+  try {
+    return await clobClient.getOrder(orderId);
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchTrades(tokenId: string, after?: string): Promise<Trade[]> {
+  if (!clobClient || !tokenId) return [];
+  try {
+    const trades = await clobClient.getTrades({
+      asset_id: tokenId,
+      after,
+    }, true);
+    return Array.isArray(trades) ? trades : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function calculateImmediatePrice(tokenId: string, side: "BUY" | "SELL", amount: number): Promise<number | null> {
+  if (!clobClient || !tokenId || amount <= 0) return null;
+  try {
+    const price = await clobClient.calculateMarketPrice(
+      tokenId,
+      side === "BUY" ? Side.BUY : Side.SELL,
+      amount,
+      OrderType.FAK,
+    );
+    return Number.isFinite(price) ? Number(price) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function cancelExchangeOrder(orderId: string): Promise<boolean> {
+  if (!clobClient || !orderId) return false;
+  try {
+    const response = await clobClient.cancelOrder({ orderID: orderId } as any);
+    const cancelled = Array.isArray((response as any)?.canceled) ? (response as any).canceled.map(String) : [];
+    return cancelled.includes(orderId);
   } catch {
     return false;
   }
