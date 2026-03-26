@@ -122,8 +122,8 @@ async function exitAll(): Promise<void> {
 
   const sold = await sellAllPositions();
   const st = getState();
-  console.log(`\n  Sold: ${sold} position(s)`);
-  console.log(`  Balance: $${st.balance.toFixed(2)}`);
+  console.log(`\n  Exit orders submitted: ${sold}`);
+  console.log(`  Balance: $${st.balance.toFixed(2)} | Available: $${st.available_balance.toFixed(2)}`);
   console.log(`${"=".repeat(55)}\n`);
 }
 

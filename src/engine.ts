@@ -1,33 +1,57 @@
 import axios from "axios";
-import type { State, Market, Position, Outcome, ForecastSnap, MarketSnap } from "./types.js";
+import type {
+  EntrySignal,
+  ExitIntent,
+  ExitReason,
+  ForecastSnap,
+  Market,
+  MarketSnap,
+  Outcome,
+  State,
+} from "./types.js";
 import {
-  LOCATIONS, MONTHS, TIMEZONES,
-  MIN_HOURS, MAX_HOURS, MIN_VOLUME, MIN_EV, MAX_PRICE, MAX_SLIPPAGE,
-  BALANCE_FALLBACK, LIVE_TRADING, VC_KEY,
+  BALANCE_FALLBACK,
+  LIVE_TRADING,
+  LOCATIONS,
+  MAX_HOURS,
+  MAX_PRICE,
+  MAX_SLIPPAGE,
+  MIN_EV,
+  MIN_HOURS,
+  MIN_VOLUME,
+  MONTHS,
+  VC_KEY,
 } from "./config.js";
-import { round2, round4, bucketProb, calcEv, calcKelly, betSize, inBucket, getSigma } from "./math.js";
-import { getEcmwf, getHrrr, getMetar, getActualTemp } from "./forecast.js";
-import { getPolymarketEvent, parseOutcomes, hoursToResolution, checkMarketResolved } from "./polymarket.js";
+import { fetchOpenOrders } from "./clob.js";
+import {
+  markMarketPrice,
+  marketHasActiveOrder,
+  marketHasExposure,
+  reconcilePositionsWithExchange,
+  submitBuyOrder,
+  submitSellOrder,
+  syncOrderStatus,
+} from "./execution.js";
+import { getActualTemp, getEcmwf, getHrrr, getMetar } from "./forecast.js";
+import { betSize, bucketProb, calcEv, calcKelly, getSigma, inBucket, round2, round4 } from "./math.js";
+import { checkMarketResolved, getPolymarketEvent, hoursToResolution, parseOutcomes } from "./polymarket.js";
+import { createRestoredPositionFromBalance } from "./position-state.js";
 import { fetchPolymarketBalance, getTokenBalance } from "./wallet.js";
-import { getClobClient, placeLiveOrder, hasExistingOrders } from "./clob.js";
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+export const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 export function formatDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
 export function addDays(d: Date, n: number): Date {
-  const result = new Date(d);
-  result.setUTCDate(result.getUTCDate() + n);
-  return result;
+  const copy = new Date(d);
+  copy.setUTCDate(copy.getUTCDate() + n);
+  return copy;
 }
 
-// ── In-memory state ──────────────────────────────────────────────────────────
-
 const marketStore = new Map<string, Market>();
+const pendingEntrySignals = new Map<string, EntrySignal>();
 
 export function getMarket(key: string): Market | null {
   return marketStore.get(key) ?? null;
@@ -41,230 +65,177 @@ export function getAllMarkets(): Market[] {
   return Array.from(marketStore.values());
 }
 
-function newMarket(citySlug: string, dateStr: string, event: any, hours: number): Market {
+function marketKey(city: string, date: string): string {
+  return `${city}_${date}`;
+}
+
+function newMarket(citySlug: string, date: string, event: any, hours: number): Market {
   const loc = LOCATIONS[citySlug];
   return {
-    city:               citySlug,
-    city_name:          loc.name,
-    date:               dateStr,
-    unit:               loc.unit,
-    station:            loc.station,
-    event_end_date:     event.endDate || "",
-    hours_at_discovery: Math.round(hours * 10) / 10,
-    status:             "open",
-    position:           null,
-    actual_temp:        null,
-    resolved_outcome:   null,
-    pnl:                null,
+    city: citySlug,
+    city_name: loc.name,
+    date,
+    unit: loc.unit,
+    station: loc.station,
+    event_end_date: event.endDate || "",
+    hours_at_discovery: round4(hours),
+    status: "open",
+    position: null,
+    orders: [],
+    actual_temp: null,
+    resolved_outcome: null,
+    pnl: null,
     forecast_snapshots: [],
-    market_snapshots:   [],
-    all_outcomes:       [],
-    created_at:         new Date().toISOString(),
+    market_snapshots: [],
+    all_outcomes: [],
+    created_at: new Date().toISOString(),
   };
 }
 
-// ── Global runtime state ─────────────────────────────────────────────────────
-
 let state: State = {
-  balance:          BALANCE_FALLBACK,
+  balance: BALANCE_FALLBACK,
+  available_balance: BALANCE_FALLBACK,
+  reserved_balance: 0,
   starting_balance: BALANCE_FALLBACK,
-  total_trades:     0,
-  wins:             0,
-  losses:           0,
-  peak_balance:     BALANCE_FALLBACK,
+  total_trades: 0,
+  wins: 0,
+  losses: 0,
+  peak_balance: BALANCE_FALLBACK,
+  realized_pnl: 0,
 };
 
-export function getState(): State { return state; }
+export function getState(): State {
+  return state;
+}
+
+function recalculateBalances(): void {
+  const reserved = getAllMarkets().reduce((sum, market) => {
+    return sum + market.orders
+      .filter(order => !order.is_terminal && order.side === "BUY")
+      .reduce((orderSum, order) => orderSum + Math.max(0, order.requested_notional - order.fill.filled_notional), 0);
+  }, 0);
+
+  state.reserved_balance = round2(reserved);
+  state.available_balance = round2(Math.max(0, state.balance - state.reserved_balance));
+  state.peak_balance = Math.max(state.peak_balance, state.balance);
+  state.realized_pnl = round2(
+    getAllMarkets().reduce((sum, market) => sum + (market.position?.phase === "closed" ? market.position.realized_pnl : 0), 0),
+  );
+}
+
+function applyPaperCashFromSync(marketBefore: Market, marketAfter: Market): void {
+  if (LIVE_TRADING) return;
+
+  const orderIds = new Set([
+    ...marketBefore.orders.map(order => order.order_id),
+    ...marketAfter.orders.map(order => order.order_id),
+  ]);
+
+  let cashDelta = 0;
+  for (const orderId of orderIds) {
+    const before = marketBefore.orders.find(order => order.order_id === orderId);
+    const after = marketAfter.orders.find(order => order.order_id === orderId);
+    if (!after) continue;
+    const delta = round4(after.fill.filled_notional - (before?.fill.filled_notional ?? 0));
+    if (delta <= 0) continue;
+    cashDelta += after.side === "BUY" ? -delta : delta;
+  }
+
+  if (cashDelta !== 0) state.balance = round2(state.balance + cashDelta);
+}
 
 export async function syncBalance(): Promise<void> {
+  if (!LIVE_TRADING) {
+    recalculateBalances();
+    return;
+  }
+
   const live = await fetchPolymarketBalance();
   if (live != null) {
     state.balance = round2(live);
     if (state.starting_balance === BALANCE_FALLBACK) state.starting_balance = state.balance;
-    state.peak_balance = Math.max(state.peak_balance, state.balance);
-    console.log(`  [WALLET] Balance: $${state.balance.toFixed(2)}`);
+    recalculateBalances();
+    console.log(`  [WALLET] Balance: $${state.balance.toFixed(2)} | Available: $${state.available_balance.toFixed(2)} | Reserved: $${state.reserved_balance.toFixed(2)}`);
   }
 }
 
-// ── Restore positions from on-chain data ─────────────────────────────────────
-
-/**
- * At startup, scan all weather markets and check on-chain CTF balances
- * to reconstruct any open positions from a previous run.
- */
-export async function restorePositions(): Promise<number> {
-  const now = new Date();
-  let restored = 0;
-
-  for (const [citySlug, loc] of Object.entries(LOCATIONS)) {
-    const dates: string[] = [];
-    for (let i = 0; i < 4; i++) dates.push(formatDate(addDays(now, i)));
-
-    for (const date of dates) {
-      // Skip if already tracked in memory
-      if (getMarket(`${citySlug}_${date}`) != null) continue;
-
-      const dt = new Date(date + "T00:00:00Z");
-      const event = await getPolymarketEvent(
-        citySlug, MONTHS[dt.getUTCMonth()], dt.getUTCDate(), dt.getUTCFullYear()
-      );
-      if (!event) continue;
-
-      const outcomes = parseOutcomes(event.markets || []);
-
-      for (const o of outcomes) {
-        if (!o.token_id) continue;
-        const shares = await getTokenBalance(o.token_id);
-        if (shares < 0.01) continue;
-
-        // We hold shares on this token — reconstruct position
-        const endDate = event.endDate || "";
-        const hours = endDate ? hoursToResolution(endDate) : 0;
-
-        const mkt: Market = {
-          city:               citySlug,
-          city_name:          loc.name,
-          date,
-          unit:               loc.unit,
-          station:            loc.station,
-          event_end_date:     endDate,
-          hours_at_discovery: Math.round(hours * 10) / 10,
-          status:             "open",
-          position:           null,
-          actual_temp:        null,
-          resolved_outcome:   null,
-          pnl:                null,
-          forecast_snapshots: [],
-          market_snapshots:   [],
-          all_outcomes:       outcomes,
-          created_at:         new Date().toISOString(),
-        };
-
-        // Use current market price as estimated entry (conservative)
-        const entryPrice = o.price || o.bid || 0.50;
-        mkt.position = {
-          market_id:     o.market_id,
-          token_id:      o.token_id,
-          question:      o.question,
-          bucket_low:    o.range[0],
-          bucket_high:   o.range[1],
-          entry_price:   entryPrice,
-          bid_at_entry:  o.bid,
-          spread:        o.spread,
-          shares:        round2(shares),
-          cost:          round2(shares * entryPrice),
-          p:             0,
-          ev:            0,
-          kelly:         0,
-          forecast_temp: 0,
-          forecast_src:  null,
-          sigma:         0,
-          opened_at:     new Date().toISOString(),
-          status:        "open",
-          pnl:           null,
-          exit_price:    null,
-          close_reason:  null,
-          closed_at:     null,
-          neg_risk:      o.neg_risk,
-          tick_size:     o.tick_size,
-        };
-
-        setMarket(mkt);
-        restored++;
-        const unitSym = loc.unit === "F" ? "F" : "C";
-        const label = `${o.range[0]}-${o.range[1]}${unitSym}`;
-        console.log(`  [RESTORE] ${loc.name} ${date} | ${label} | ${shares.toFixed(2)} shares @ ~$${entryPrice.toFixed(3)}`);
-        break; // one position per market date
-      }
-
-      await sleep(100);
-    }
-  }
-
-  return restored;
+function getCurrentMarkPrice(outcomes: Outcome[], tokenId: string): number | null {
+  const outcome = outcomes.find(item => item.token_id === tokenId);
+  if (!outcome) return null;
+  return outcome.bid ?? outcome.price ?? null;
 }
 
-// ── Sell all positions ───────────────────────────────────────────────────────
-
-/**
- * Sell/exit ALL open positions at current market price.
- * Used when the user wants to close everything and stop.
- */
-export async function sellAllPositions(): Promise<number> {
-  const openPos = getAllMarkets().filter(m => m.position?.status === "open");
-  if (openPos.length === 0) return 0;
-
-  const clobClient = getClobClient();
-  let sold = 0;
-
-  for (const mkt of openPos) {
-    const pos = mkt.position!;
-    const cityName = LOCATIONS[mkt.city]?.name || mkt.city;
-    const unitSym = mkt.unit === "F" ? "F" : "C";
-    const label = `${pos.bucket_low}-${pos.bucket_high}${unitSym}`;
-
-    // Get current bid price
-    let currentPrice: number | null = null;
-    try {
-      const { data: mdata } = await axios.get(
-        `https://gamma-api.polymarket.com/markets/${pos.market_id}`,
-        { timeout: 5000 }
-      );
-      if (mdata.bestBid != null) currentPrice = Number(mdata.bestBid);
-    } catch { /* ignore */ }
-
-    if (currentPrice == null) currentPrice = pos.entry_price * 0.90;
-
-    if (LIVE_TRADING && clobClient && pos.token_id) {
-      const orderId = await placeLiveOrder(
-        pos.token_id, "SELL", currentPrice, pos.shares,
-        pos.tick_size || "0.01", pos.neg_risk || false,
-      );
-      if (!orderId) {
-        console.log(`  [EXIT FAILED] ${cityName} ${mkt.date} | ${label}`);
-        continue;
-      }
-    }
-
-    const pnl = round2((currentPrice - pos.entry_price) * pos.shares);
-    pos.exit_price   = currentPrice;
-    pos.pnl          = pnl;
-    pos.close_reason = "manual_exit";
-    pos.closed_at    = new Date().toISOString();
-    pos.status       = "closed";
-    mkt.status       = "closed";
-    setMarket(mkt);
-    sold++;
-
-    console.log(
-      `  [EXIT] ${cityName} ${mkt.date} | ${label} | ` +
-      `${pos.shares.toFixed(2)} shares @ $${currentPrice.toFixed(3)} | ` +
-      `PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`
-    );
-    await sleep(300);
-  }
-
-  return sold;
+function appendForecastSnapshot(market: Market, snap: any, horizon: string, hoursLeft: number): Market {
+  const forecastSnap: ForecastSnap = {
+    ts: snap.ts ?? null,
+    horizon,
+    hours_left: round4(hoursLeft),
+    ecmwf: snap.ecmwf ?? null,
+    hrrr: snap.hrrr ?? null,
+    metar: snap.metar ?? null,
+    best: snap.best ?? null,
+    best_source: snap.best_source ?? null,
+  };
+  return {
+    ...market,
+    forecast_snapshots: [...market.forecast_snapshots, forecastSnap],
+  };
 }
 
-// ── Forecast snapshot ────────────────────────────────────────────────────────
+function appendMarketSnapshot(market: Market, snap: any, outcomes: Outcome[]): Market {
+  const top = outcomes.length > 0 ? outcomes.reduce((a, b) => (a.price > b.price ? a : b)) : null;
+  const label = top ? `${top.range[0]}-${top.range[1]}${market.unit}` : null;
+  const marketSnap: MarketSnap = {
+    ts: snap.ts ?? null,
+    top_bucket: label,
+    top_price: top?.price ?? null,
+  };
+  return {
+    ...market,
+    market_snapshots: [...market.market_snapshots, marketSnap],
+  };
+}
 
-async function takeForecastSnapshot(citySlug: string, dates: string[]) {
-  const nowStr = new Date().toISOString();
-  const ecmwf  = await getEcmwf(citySlug, dates);
-  const hrrr   = await getHrrr(citySlug, dates);
-  const today  = formatDate(new Date());
+async function fetchBestBid(marketId: string): Promise<number | null> {
+  try {
+    const { data } = await axios.get(`https://gamma-api.polymarket.com/markets/${marketId}`, { timeout: 5000 });
+    if (data.bestBid != null) return Number(data.bestBid);
+  } catch {
+    return null;
+  }
+  return null;
+}
 
-  const snapshots: Record<string, any> = {};
-  for (const date of dates) {
-    const maxHrrrDate = formatDate(addDays(new Date(), 2));
-    const snap: any = {
-      ts:    nowStr,
-      ecmwf: ecmwf[date] ?? null,
-      hrrr:  (date <= maxHrrrDate) ? (hrrr[date] ?? null) : null,
-      metar: (date === today) ? await getMetar(citySlug) : null,
+async function fetchTopOfBook(marketId: string): Promise<{ bid: number | null; ask: number | null }> {
+  try {
+    const { data } = await axios.get(`https://gamma-api.polymarket.com/markets/${marketId}`, { timeout: 5000 });
+    return {
+      bid: data.bestBid != null ? Number(data.bestBid) : null,
+      ask: data.bestAsk != null ? Number(data.bestAsk) : null,
     };
+  } catch {
+    return { bid: null, ask: null };
+  }
+}
+
+async function takeForecastSnapshot(citySlug: string, dates: string[]): Promise<Record<string, any>> {
+  const now = new Date();
+  const nowStr = now.toISOString();
+  const ecmwf = await getEcmwf(citySlug, dates);
+  const hrrr = await getHrrr(citySlug, dates);
+  const today = formatDate(now);
+  const maxHrrrDate = formatDate(addDays(now, 2));
+
+  const result: Record<string, any> = {};
+  for (const date of dates) {
     const loc = LOCATIONS[citySlug];
+    const snap: any = {
+      ts: nowStr,
+      ecmwf: ecmwf[date] ?? null,
+      hrrr: date <= maxHrrrDate ? (hrrr[date] ?? null) : null,
+      metar: date === today ? await getMetar(citySlug) : null,
+    };
+
     if (loc.region === "us" && snap.hrrr != null) {
       snap.best = snap.hrrr;
       snap.best_source = "hrrr";
@@ -275,407 +246,512 @@ async function takeForecastSnapshot(citySlug: string, dates: string[]) {
       snap.best = null;
       snap.best_source = null;
     }
-    snapshots[date] = snap;
+    result[date] = snap;
   }
-  return snapshots;
+  return result;
 }
 
-// ── Core scan ────────────────────────────────────────────────────────────────
+function updateStopState(market: Market, currentBid: number): Market {
+  const position = market.position;
+  if (!position || position.phase === "closed") return market;
+
+  const stop = position.stop_price ?? position.average_entry_price * 0.8;
+  if (currentBid >= position.average_entry_price * 1.2 && stop < position.average_entry_price) {
+    const updatedPosition = {
+      ...position,
+      stop_price: round4(position.average_entry_price),
+      trailing_activated: true,
+      last_updated_at: new Date().toISOString(),
+    };
+    console.log(`  [TRAILING ARMED] ${market.city_name} ${market.date} | stop moved to breakeven $${position.average_entry_price.toFixed(3)}`);
+    return { ...market, position: updatedPosition };
+  }
+
+  return market;
+}
+
+function getTakeProfit(hoursLeft: number): number | null {
+  if (hoursLeft >= 48) return 0.75;
+  if (hoursLeft >= 24) return 0.85;
+  return null;
+}
+
+function evaluateExitIntent(market: Market, currentBid: number | null, forecastTemp: number | null): { market: Market; exitIntent: ExitIntent | null } {
+  if (!market.position || market.position.phase === "closed" || currentBid == null) {
+    return { market, exitIntent: null };
+  }
+
+  const nextMarket = updateStopState(market, currentBid);
+  const position = nextMarket.position!;
+  const stop = position.stop_price ?? position.average_entry_price * 0.8;
+  const hoursLeft = nextMarket.event_end_date ? hoursToResolution(nextMarket.event_end_date) : 999;
+  const takeProfit = getTakeProfit(hoursLeft);
+
+  if (currentBid <= stop) {
+    const reason: ExitReason = currentBid < position.average_entry_price ? "stop_loss" : "trailing_stop";
+    return {
+      market: nextMarket,
+      exitIntent: { reason, signal_price: currentBid, mark_price: currentBid, limit_price: currentBid },
+    };
+  }
+
+  if (takeProfit != null && currentBid >= takeProfit) {
+    return {
+      market: nextMarket,
+      exitIntent: { reason: "take_profit", signal_price: currentBid, mark_price: currentBid, limit_price: currentBid },
+    };
+  }
+
+  if (forecastTemp != null) {
+    const buffer = nextMarket.unit === "F" ? 2 : 1;
+    const midBucket = (position.bucket_low !== -999 && position.bucket_high !== 999)
+      ? (position.bucket_low + position.bucket_high) / 2
+      : forecastTemp;
+    const forecastFar = Math.abs(forecastTemp - midBucket) > (Math.abs(midBucket - position.bucket_low) + buffer);
+    if (!inBucket(forecastTemp, position.bucket_low, position.bucket_high) && forecastFar) {
+      return {
+        market: nextMarket,
+        exitIntent: { reason: "forecast_changed", signal_price: currentBid, mark_price: currentBid, limit_price: currentBid },
+      };
+    }
+  }
+
+  return { market: nextMarket, exitIntent: null };
+}
+
+function buildEntrySignal(market: Market, outcomes: Outcome[], forecastTemp: number, bestSource: string | null): EntrySignal | null {
+  let matchedBucket: Outcome | null = null;
+  for (const outcome of outcomes) {
+    if (inBucket(forecastTemp, outcome.range[0], outcome.range[1])) {
+      matchedBucket = outcome;
+      break;
+    }
+  }
+  if (!matchedBucket) return null;
+  if (matchedBucket.volume < MIN_VOLUME) return null;
+
+  const sigma = getSigma(market.city, bestSource || "ecmwf");
+  const signalAsk = matchedBucket.ask ?? matchedBucket.price;
+  const p = bucketProb(forecastTemp, matchedBucket.range[0], matchedBucket.range[1], sigma);
+  const ev = calcEv(p, signalAsk);
+  if (ev < MIN_EV || signalAsk >= MAX_PRICE) return null;
+
+  const kelly = calcKelly(p, signalAsk);
+  const notional = betSize(kelly, state.available_balance);
+  if (notional < 0.5) return null;
+
+  return {
+    market_id: matchedBucket.market_id,
+    token_id: matchedBucket.token_id,
+    question: matchedBucket.question,
+    bucket_low: matchedBucket.range[0],
+    bucket_high: matchedBucket.range[1],
+    signal_price: round4(signalAsk),
+    bid_at_signal: round4(matchedBucket.bid ?? matchedBucket.price),
+    spread_at_signal: round4(matchedBucket.spread || 0),
+    mark_price: round4(matchedBucket.bid ?? matchedBucket.price),
+    limit_price: round4(signalAsk),
+    planned_shares: round4(notional / signalAsk),
+    planned_notional: round2(notional),
+    p: round4(p),
+    ev: round4(ev),
+    kelly: round4(kelly),
+    forecast_temp: forecastTemp,
+    forecast_src: bestSource,
+    sigma,
+    neg_risk: matchedBucket.neg_risk,
+    tick_size: matchedBucket.tick_size,
+  };
+}
+
+async function validateEntrySignal(market: Market, signal: EntrySignal): Promise<EntrySignal | null> {
+  const top = await fetchTopOfBook(signal.market_id);
+  const realAsk = top.ask ?? signal.signal_price;
+  const realBid = top.bid ?? signal.bid_at_signal;
+  const realSpread = round4(realAsk - realBid);
+  if (realSpread > MAX_SLIPPAGE || realAsk >= MAX_PRICE) {
+    console.log(`  [SIGNAL SKIPPED] ${market.city_name} ${market.date} | ask $${realAsk.toFixed(3)} | spread $${realSpread.toFixed(3)}`);
+    return null;
+  }
+
+  return {
+    ...signal,
+    signal_price: round4(realAsk),
+    bid_at_signal: round4(realBid),
+    spread_at_signal: realSpread,
+    mark_price: round4(realBid),
+    limit_price: round4(realAsk),
+    planned_shares: round4(signal.planned_notional / realAsk),
+    ev: round4(calcEv(signal.p, realAsk)),
+  };
+}
+
+function countPositionOpenTransition(before: Market["position"], after: Market["position"]): number {
+  const beforeOpen = !!before && before.phase !== "closed";
+  const afterOpen = !!after && after.phase !== "closed";
+  return beforeOpen || !afterOpen ? 0 : 1;
+}
+
+function countPositionClosedTransition(before: Market["position"], after: Market["position"]): number {
+  const beforeOpen = !!before && before.phase !== "closed";
+  const afterClosed = !!after && after.phase === "closed" && after.close_reason !== "resolved";
+  return beforeOpen && afterClosed ? 1 : 0;
+}
+
+async function syncMarketExecution(market: Market): Promise<Market> {
+  const before = market;
+  const { market: next } = await syncOrderStatus(market, pendingEntrySignals);
+  applyPaperCashFromSync(before, next);
+
+  for (const order of next.orders) {
+    if (order.intent === "entry" && order.is_terminal) {
+      pendingEntrySignals.delete(order.order_id);
+    }
+  }
+
+  if (!before.position && next.position && next.position.phase !== "closed") {
+    state.total_trades += 1;
+  }
+
+  return next;
+}
+
+function toOrderMap(orders: Awaited<ReturnType<typeof fetchOpenOrders>>): Map<string, Awaited<ReturnType<typeof fetchOpenOrders>>> {
+  const byToken = new Map<string, Awaited<ReturnType<typeof fetchOpenOrders>>>();
+  for (const order of orders) {
+    const current = byToken.get(order.asset_id) ?? [];
+    current.push(order);
+    byToken.set(order.asset_id, current);
+  }
+  return byToken;
+}
+
+function importRestoredOpenOrder(market: Market, order: any): Market {
+  const exists = market.orders.some(item => item.order_id === order.id);
+  if (exists) return market;
+
+  const requestedShares = Number(order.original_size || 0);
+  const filledShares = Number(order.size_matched || 0);
+  const restoredOrder = {
+    order_id: String(order.id),
+    market_id: String(order.market),
+    token_id: String(order.asset_id),
+    question: market.position?.question ?? "",
+    bucket_low: market.position?.bucket_low ?? 0,
+    bucket_high: market.position?.bucket_high ?? 0,
+    side: order.side === "SELL" ? "SELL" : "BUY",
+    intent: order.side === "SELL" ? "exit" : "entry",
+    status: "open",
+    strategy: "market-fak",
+    order_type: "FAK",
+    submitted_at: new Date(Number(order.created_at || Date.now())).toISOString(),
+    completed_at: null,
+    last_synced_at: null,
+    exchange_status: String(order.status || "open"),
+    requested_shares: round4(requestedShares),
+    requested_notional: round2(requestedShares * Number(order.price || 0)),
+    remaining_shares: round4(Math.max(0, requestedShares - filledShares)),
+    pricing: {
+      signal_price: Number(order.price || 0),
+      limit_price: Number(order.price || 0),
+      fill_price: filledShares > 0 ? Number(order.price || 0) : null,
+      mark_price: market.position?.exit.mark_price ?? null,
+    },
+    fill: {
+      filled_shares: round4(filledShares),
+      filled_notional: round4(filledShares * Number(order.price || 0)),
+      average_price: filledShares > 0 ? Number(order.price || 0) : null,
+      trade_ids: [],
+      transaction_hashes: [],
+      first_filled_at: null,
+      last_filled_at: null,
+    },
+    tick_size: market.position?.tick_size || "0.01",
+    neg_risk: market.position?.neg_risk || false,
+    error: null,
+    is_open_on_exchange: true,
+    is_terminal: false,
+    close_reason: market.position?.phase === "closing" ? market.position.close_reason : null,
+  } as const;
+
+  return {
+    ...market,
+    orders: [...market.orders, restoredOrder as any],
+  };
+}
+
+export async function restorePositions(): Promise<number> {
+  const now = new Date();
+  let restored = 0;
+  const liveOpenOrders = LIVE_TRADING ? toOrderMap(await fetchOpenOrders()) : new Map();
+
+  for (const [citySlug, loc] of Object.entries(LOCATIONS)) {
+    const dates = Array.from({ length: 4 }, (_, index) => formatDate(addDays(now, index)));
+
+    for (const date of dates) {
+      if (getMarket(marketKey(citySlug, date))) continue;
+
+      const dt = new Date(`${date}T00:00:00Z`);
+      const event = await getPolymarketEvent(citySlug, MONTHS[dt.getUTCMonth()], dt.getUTCDate(), dt.getUTCFullYear());
+      if (!event) continue;
+
+      const outcomes = parseOutcomes(event.markets || []);
+      const endDate = event.endDate || "";
+      const hours = endDate ? hoursToResolution(endDate) : 0;
+      let market = newMarket(citySlug, date, event, hours);
+      market.all_outcomes = outcomes;
+
+      for (const outcome of outcomes) {
+        if (!outcome.token_id) continue;
+        const shares = await getTokenBalance(outcome.token_id);
+        if (shares < 0.01) continue;
+
+        market.position = createRestoredPositionFromBalance(market, outcome, shares, new Date().toISOString());
+        const openOrders = liveOpenOrders.get(outcome.token_id) ?? [];
+        for (const openOrder of openOrders) {
+          market = importRestoredOpenOrder(market, openOrder);
+        }
+        restored += 1;
+        console.log(
+          `  [RESTORE POSITION] ${loc.name} ${date} | ${outcome.range[0]}-${outcome.range[1]}${loc.unit} | ` +
+          `${shares.toFixed(2)} shares | entry estimated at ~$${market.position!.average_entry_price.toFixed(3)}`,
+        );
+        if (openOrders.length > 0) {
+          console.log(`  [RESTORE ORDERS] ${loc.name} ${date} | imported ${openOrders.length} open order(s)`);
+        }
+        break;
+      }
+
+      setMarket(market);
+      await sleep(50);
+    }
+  }
+
+  const reconciled = await reconcilePositionsWithExchange(getAllMarkets(), pendingEntrySignals);
+  for (const market of reconciled) setMarket(market);
+  recalculateBalances();
+  return restored;
+}
+
+export async function sellAllPositions(): Promise<number> {
+  let submitted = 0;
+
+  for (const market of getAllMarkets()) {
+    if (!marketHasExposure(market) || marketHasActiveOrder(market, "SELL")) continue;
+    const position = market.position!;
+    const bestBid = await fetchBestBid(position.market_id) ?? position.exit.mark_price ?? position.average_entry_price;
+    const { market: next, submitted: didSubmit } = await submitSellOrder(market, {
+      reason: "manual_exit",
+      signal_price: bestBid,
+      mark_price: bestBid,
+      limit_price: bestBid,
+    });
+    if (didSubmit) {
+      submitted += 1;
+      setMarket(next);
+    }
+    await sleep(100);
+  }
+
+  recalculateBalances();
+  return submitted;
+}
+
+async function maybeResolveMarket(market: Market): Promise<{ market: Market; resolved: boolean }> {
+  const position = market.position;
+  if (!position || position.phase === "closed" || market.status === "resolved") {
+    return { market, resolved: false };
+  }
+
+  const won = await checkMarketResolved(position.market_id);
+  if (won === null) return { market, resolved: false };
+
+  if (VC_KEY && market.actual_temp == null) {
+    const actual = await getActualTemp(market.city, market.date);
+    if (actual != null) {
+      market.actual_temp = actual;
+      console.log(`  [VC] ${market.city_name} ${market.date} actual: ${actual}°${market.unit}`);
+    }
+  }
+
+  const proceeds = won ? round2(position.shares_open) : 0;
+  const realizedDelta = round2(proceeds - position.shares_open * position.average_entry_price);
+  const nextPosition = {
+    ...position,
+    phase: "closed" as const,
+    pending_exit_order_id: null,
+    shares_closed: round4(position.shares_closed + position.shares_open),
+    shares_open: 0 as const,
+    total_exit_proceeds: round2(position.total_exit_proceeds + proceeds),
+    average_exit_price: won ? 1 : 0,
+    realized_pnl: round2(position.realized_pnl + realizedDelta),
+    unrealized_pnl: 0,
+    close_reason: "resolved" as const,
+    closed_at: new Date().toISOString(),
+    exit: {
+      signal_price: 1,
+      limit_price: null,
+      fill_price: won ? 1 : 0,
+      mark_price: won ? 1 : 0,
+    },
+  };
+
+  if (!LIVE_TRADING) state.balance = round2(state.balance + proceeds);
+
+  const resolvedMarket: Market = {
+    ...market,
+    position: nextPosition,
+    pnl: nextPosition.realized_pnl,
+    status: "resolved",
+    resolved_outcome: won ? "win" : "loss",
+  };
+
+  if (won) state.wins += 1;
+  else state.losses += 1;
+
+  console.log(`  [RESOLVED ${won ? "WIN" : "LOSS"}] ${market.city_name} ${market.date} | PnL ${nextPosition.realized_pnl >= 0 ? "+" : ""}${nextPosition.realized_pnl.toFixed(2)}`);
+  return { market: resolvedMarket, resolved: true };
+}
 
 export async function scanAndUpdate(options: { buyEnabled?: boolean } = {}): Promise<{ newPos: number; closed: number; resolved: number }> {
   const { buyEnabled = true } = options;
-  const now     = new Date();
-  await syncBalance();
-  let balance   = state.balance;
-  let newPos    = 0;
-  let closed    = 0;
-  let resolved  = 0;
+  const now = new Date();
+  let newPos = 0;
+  let closed = 0;
+  let resolved = 0;
 
-  const clobClient = getClobClient();
+  await syncBalance();
 
   for (const [citySlug, loc] of Object.entries(LOCATIONS)) {
-    const unitSym = loc.unit === "F" ? "F" : "C";
     process.stdout.write(`  -> ${loc.name}... `);
+    const dates = Array.from({ length: 4 }, (_, index) => formatDate(addDays(now, index)));
 
-    let snapshots: Record<string, any>;
+    let forecastSnapshots: Record<string, any>;
     try {
-      const dates: string[] = [];
-      for (let i = 0; i < 4; i++) dates.push(formatDate(addDays(now, i)));
-      snapshots = await takeForecastSnapshot(citySlug, dates);
-      await sleep(300);
-    } catch (e: any) {
-      console.log(`skipped (${e.message})`);
+      forecastSnapshots = await takeForecastSnapshot(citySlug, dates);
+    } catch (error: any) {
+      console.log(`skipped (${error.message})`);
       continue;
     }
 
-    const dates: string[] = [];
-    for (let i = 0; i < 4; i++) dates.push(formatDate(addDays(now, i)));
-
-    for (let i = 0; i < dates.length; i++) {
-      const date = dates[i];
-      const dt   = new Date(date + "T00:00:00Z");
+    for (let index = 0; index < dates.length; index++) {
+      const date = dates[index];
+      const dt = new Date(`${date}T00:00:00Z`);
       const event = await getPolymarketEvent(citySlug, MONTHS[dt.getUTCMonth()], dt.getUTCDate(), dt.getUTCFullYear());
       if (!event) continue;
 
       const endDate = event.endDate || "";
-      const hours   = endDate ? hoursToResolution(endDate) : 0;
-      const horizon = `D+${i}`;
+      const hours = endDate ? hoursToResolution(endDate) : 0;
+      if (hours > MAX_HOURS) continue;
 
-      const mktKey = `${citySlug}_${date}`;
-      let mkt = getMarket(mktKey);
-      if (mkt === null) {
-        if (hours < MIN_HOURS || hours > MAX_HOURS) continue;
-        mkt = newMarket(citySlug, date, event, hours);
-      }
-
-      if (mkt.status === "resolved") continue;
-
-      // Update outcomes
       const outcomes = parseOutcomes(event.markets || []);
-      mkt.all_outcomes = outcomes;
+      const snap = forecastSnapshots[date] || {};
+      const forecastTemp = snap.best ?? null;
+      const bestSource = snap.best_source ?? null;
+      const horizon = `D+${index}`;
+      let market = getMarket(marketKey(citySlug, date)) ?? newMarket(citySlug, date, event, hours);
+      const beforePosition = market.position;
 
-      // Forecast snapshot
-      const snap = snapshots[date] || {};
-      const forecastSnap: ForecastSnap = {
-        ts:          snap.ts ?? null,
-        horizon,
-        hours_left:  Math.round(hours * 10) / 10,
-        ecmwf:       snap.ecmwf ?? null,
-        hrrr:        snap.hrrr ?? null,
-        metar:       snap.metar ?? null,
-        best:        snap.best ?? null,
-        best_source: snap.best_source ?? null,
+      market = {
+        ...market,
+        event_end_date: endDate,
+        hours_at_discovery: round4(hours),
+        all_outcomes: outcomes,
       };
-      mkt.forecast_snapshots.push(forecastSnap);
+      market = appendForecastSnapshot(market, snap, horizon, hours);
+      market = appendMarketSnapshot(market, snap, outcomes);
 
-      // Market price snapshot
-      const top = outcomes.length > 0
-        ? outcomes.reduce((a, b) => a.price > b.price ? a : b)
-        : null;
-      const marketSnap: MarketSnap = {
-        ts:         snap.ts ?? null,
-        top_bucket: top ? `${top.range[0]}-${top.range[1]}${unitSym}` : null,
-        top_price:  top ? top.price : null,
-      };
-      mkt.market_snapshots.push(marketSnap);
-
-      const forecastTemp: number | null = snap.best ?? null;
-      const bestSource: string | null   = snap.best_source ?? null;
-
-      // --- STOP-LOSS AND TRAILING STOP ---
-      if (mkt.position && mkt.position.status === "open") {
-        const pos = mkt.position;
-        let currentPrice: number | null = null;
-        for (const o of outcomes) {
-          if (o.market_id === pos.market_id) { currentPrice = o.price; break; }
-        }
-
-        if (currentPrice != null) {
-          for (const o of outcomes) {
-            if (o.market_id === pos.market_id) { currentPrice = o.bid ?? currentPrice; break; }
-          }
-          const entry = pos.entry_price;
-          const stop  = pos.stop_price ?? entry * 0.80;
-
-          if (currentPrice >= entry * 1.20 && stop < entry) {
-            pos.stop_price = entry;
-            pos.trailing_activated = true;
-          }
-
-          if (currentPrice <= stop) {
-            if (LIVE_TRADING && clobClient && pos.token_id) {
-              await placeLiveOrder(pos.token_id, "SELL", currentPrice, pos.shares, pos.tick_size || "0.01", pos.neg_risk || false);
-            }
-            const pnl = round2((currentPrice - entry) * pos.shares);
-            balance += pos.cost + pnl;
-            pos.closed_at    = snap.ts ?? null;
-            pos.close_reason = currentPrice < entry ? "stop_loss" : "trailing_stop";
-            pos.exit_price   = currentPrice;
-            pos.pnl          = pnl;
-            pos.status       = "closed";
-            closed += 1;
-            const reason = currentPrice < entry ? "STOP" : "TRAILING BE";
-            console.log(`  [${reason}] ${loc.name} ${date} | entry $${entry.toFixed(3)} exit $${currentPrice.toFixed(3)} | PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
-          }
-        }
+      if (market.position) {
+        const mark = getCurrentMarkPrice(outcomes, market.position.token_id);
+        market = markMarketPrice(market, mark);
       }
 
-      // --- CLOSE POSITION if forecast shifted 2+ degrees ---
-      if (mkt.position && mkt.position.status === "open" && forecastTemp != null) {
-        const pos = mkt.position;
-        const buffer = loc.unit === "F" ? 2.0 : 1.0;
-        const midBucket = (pos.bucket_low !== -999 && pos.bucket_high !== 999)
-          ? (pos.bucket_low + pos.bucket_high) / 2
-          : forecastTemp;
-        const forecastFar = Math.abs(forecastTemp - midBucket) > (Math.abs(midBucket - pos.bucket_low) + buffer);
-        if (!inBucket(forecastTemp, pos.bucket_low, pos.bucket_high) && forecastFar) {
-          let currentPrice: number | null = null;
-          for (const o of outcomes) {
-            if (o.market_id === pos.market_id) { currentPrice = o.price; break; }
-          }
-          if (currentPrice != null) {
-            if (LIVE_TRADING && clobClient && pos.token_id) {
-              await placeLiveOrder(pos.token_id, "SELL", currentPrice, pos.shares, pos.tick_size || "0.01", pos.neg_risk || false);
-            }
-            const pnl = round2((currentPrice - pos.entry_price) * pos.shares);
-            balance += pos.cost + pnl;
-            mkt.position.closed_at    = snap.ts ?? null;
-            mkt.position.close_reason = "forecast_changed";
-            mkt.position.exit_price   = currentPrice;
-            mkt.position.pnl          = pnl;
-            mkt.position.status       = "closed";
-            closed += 1;
-            console.log(`  [CLOSE] ${loc.name} ${date} — forecast changed | PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
-          }
-        }
+      market = await syncMarketExecution(market);
+      newPos += countPositionOpenTransition(beforePosition, market.position);
+      closed += countPositionClosedTransition(beforePosition, market.position);
+
+      const currentBid = market.position ? getCurrentMarkPrice(outcomes, market.position.token_id) : null;
+      const { market: marketWithRules, exitIntent } = evaluateExitIntent(market, currentBid, forecastTemp);
+      market = marketWithRules;
+
+      if (exitIntent) {
+        const submitted = await submitSellOrder(market, exitIntent);
+        market = submitted.market;
       }
 
-      // --- OPEN POSITION ---
-      if (buyEnabled && !mkt.position && forecastTemp != null && hours >= MIN_HOURS) {
-        const sigma = getSigma(citySlug, bestSource || "ecmwf");
-        let bestSignal: Position | null = null;
-
-        let matchedBucket: Outcome | null = null;
-        for (const o of outcomes) {
-          if (inBucket(forecastTemp, o.range[0], o.range[1])) { matchedBucket = o; break; }
-        }
-
-        if (matchedBucket) {
-          const o = matchedBucket;
-          const [tLow, tHigh] = o.range;
-          if (o.volume >= MIN_VOLUME) {
-            const p  = bucketProb(forecastTemp, tLow, tHigh, sigma);
-            const ev = calcEv(p, o.ask ?? o.price);
-            if (ev >= MIN_EV) {
-              const kelly = calcKelly(p, o.ask ?? o.price);
-              const size  = betSize(kelly, balance);
-              if (size >= 0.50) {
-                bestSignal = {
-                  market_id:     o.market_id,
-                  token_id:      o.token_id,
-                  question:      o.question,
-                  bucket_low:    tLow,
-                  bucket_high:   tHigh,
-                  entry_price:   o.ask ?? o.price,
-                  bid_at_entry:  o.bid ?? o.price,
-                  spread:        o.spread || 0,
-                  shares:        round2(size / (o.ask ?? o.price)),
-                  cost:          size,
-                  p:             round4(p),
-                  ev:            round4(ev),
-                  kelly:         round4(kelly),
-                  forecast_temp: forecastTemp,
-                  forecast_src:  bestSource,
-                  sigma,
-                  opened_at:     snap.ts ?? null,
-                  status:        "open",
-                  pnl:           null,
-                  exit_price:    null,
-                  close_reason:  null,
-                  closed_at:     null,
-                  neg_risk:      o.neg_risk,
-                  tick_size:     o.tick_size,
-                };
-              }
-            }
-          }
-        }
-
-        if (bestSignal) {
-          let skipPosition = false;
-          try {
-            const { data: mdata } = await axios.get(
-              `https://gamma-api.polymarket.com/markets/${bestSignal.market_id}`,
-              { timeout: 5000 }
-            );
-            const realAsk    = Number(mdata.bestAsk ?? bestSignal.entry_price);
-            const realBid    = Number(mdata.bestBid ?? bestSignal.bid_at_entry);
-            const realSpread = round4(realAsk - realBid);
-            if (realSpread > MAX_SLIPPAGE || realAsk >= MAX_PRICE) {
-              console.log(`  [SKIP] ${loc.name} ${date} — real ask $${realAsk.toFixed(3)} spread $${realSpread.toFixed(3)}`);
-              skipPosition = true;
-            } else {
-              bestSignal.entry_price  = realAsk;
-              bestSignal.bid_at_entry = realBid;
-              bestSignal.spread       = realSpread;
-              bestSignal.shares       = round2(bestSignal.cost / realAsk);
-              bestSignal.ev           = round4(calcEv(bestSignal.p, realAsk));
-            }
-          } catch (e: any) {
-            console.log(`  [WARN] Could not fetch real ask for ${bestSignal.market_id}: ${e.message}`);
-          }
-
-          if (!skipPosition && bestSignal.entry_price < MAX_PRICE) {
-            // Guard against duplicate orders
-            if (LIVE_TRADING && clobClient && bestSignal.token_id) {
-              if (await hasExistingOrders(bestSignal.token_id)) {
-                console.log(`  [SKIP] ${loc.name} ${date} — already have open order(s) on this token`);
-                setMarket(mkt);
-                await sleep(100);
-                continue;
-              }
-            }
-            if (LIVE_TRADING && clobClient) {
-              const orderId = await placeLiveOrder(
-                bestSignal.token_id || "", "BUY",
-                bestSignal.entry_price, bestSignal.shares,
-                bestSignal.tick_size || "0.01", bestSignal.neg_risk || false,
+      if (buyEnabled && forecastTemp != null && hours >= MIN_HOURS) {
+        const hasExposure = marketHasExposure(market);
+        const hasBuyOrder = marketHasActiveOrder(market, "BUY");
+        const hasSellOrder = marketHasActiveOrder(market, "SELL");
+        if (!hasExposure && !hasBuyOrder && !hasSellOrder) {
+          const signal = buildEntrySignal(market, outcomes, forecastTemp, bestSource);
+          if (signal) {
+            const validSignal = await validateEntrySignal(market, signal);
+            if (validSignal && validSignal.ev >= MIN_EV) {
+              console.log(
+                `  [SIGNAL] ${market.city_name} ${date} | ${validSignal.bucket_low}-${validSignal.bucket_high}${market.unit} | ` +
+                `signal $${validSignal.signal_price.toFixed(3)} | EV ${validSignal.ev >= 0 ? "+" : ""}${validSignal.ev.toFixed(2)} | ` +
+                `mark $${(validSignal.mark_price ?? validSignal.signal_price).toFixed(3)}`,
               );
-              if (!orderId) {
-                console.log(`  [SKIP] ${loc.name} ${date} — live order failed, skipping`);
-                setMarket(mkt);
-                await sleep(100);
-                continue;
+              const submitted = await submitBuyOrder(market, validSignal);
+              market = submitted.market;
+              if (submitted.submitted) {
+                const latest = market.orders[market.orders.length - 1];
+                pendingEntrySignals.set(latest.order_id, validSignal);
               }
             }
-            balance -= bestSignal.cost;
-            mkt.position = bestSignal;
-            state.total_trades += 1;
-            newPos += 1;
-            const bucketLabel = `${bestSignal.bucket_low}-${bestSignal.bucket_high}${unitSym}`;
-            const mode = LIVE_TRADING && clobClient ? "LIVE BUY" : "BUY";
-            console.log(
-              `  [${mode}]  ${loc.name} ${horizon} ${date} | ${bucketLabel} | ` +
-              `$${bestSignal.entry_price.toFixed(3)} | EV ${bestSignal.ev >= 0 ? "+" : ""}${bestSignal.ev.toFixed(2)} | ` +
-              `$${bestSignal.cost.toFixed(2)} (${(bestSignal.forecast_src || "").toUpperCase()})`
-            );
           }
         }
       }
 
-      if (hours < 0.5 && mkt.status === "open") mkt.status = "closed";
+      if (hours < 0.5 && market.status === "open" && !marketHasExposure(market) && !marketHasActiveOrder(market)) {
+        market.status = "closed";
+      }
 
-      setMarket(mkt);
-      await sleep(100);
+      const resolution = await maybeResolveMarket(market);
+      market = resolution.market;
+      if (resolution.resolved) resolved += 1;
+
+      setMarket(market);
+      await sleep(75);
     }
 
     console.log("ok");
   }
 
-  // --- AUTO-RESOLUTION ---
-  for (const mkt of getAllMarkets()) {
-    if (mkt.status === "resolved") continue;
-    const pos = mkt.position;
-    if (!pos || pos.status !== "open") continue;
-    if (!pos.market_id) continue;
-
-    const won = await checkMarketResolved(pos.market_id);
-    if (won === null) continue;
-
-    if (VC_KEY && mkt.actual_temp == null) {
-      const actual = await getActualTemp(mkt.city, mkt.date);
-      if (actual != null) {
-        mkt.actual_temp = actual;
-        console.log(`  [VC] ${mkt.city_name} ${mkt.date} actual: ${actual}°${mkt.unit}`);
-      }
-    }
-
-    const pnl = won ? round2(pos.shares * (1 - pos.entry_price)) : round2(-pos.cost);
-
-    balance += pos.cost + pnl;
-    pos.exit_price   = won ? 1.0 : 0.0;
-    pos.pnl          = pnl;
-    pos.close_reason = "resolved";
-    pos.closed_at    = now.toISOString();
-    pos.status       = "closed";
-    mkt.pnl          = pnl;
-    mkt.status       = "resolved";
-    mkt.resolved_outcome = won ? "win" : "loss";
-
-    if (won) state.wins += 1;
-    else     state.losses += 1;
-
-    const result = won ? "WIN" : "LOSS";
-    console.log(`  [${result}] ${mkt.city_name} ${mkt.date} | PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
-    resolved += 1;
-
-    setMarket(mkt);
-    await sleep(300);
-  }
-
-  state.balance      = round2(balance);
-  state.peak_balance = Math.max(state.peak_balance ?? balance, balance);
-
+  recalculateBalances();
   return { newPos, closed, resolved };
 }
 
-// ── Monitor positions ────────────────────────────────────────────────────────
-
 export async function monitorPositions(): Promise<number> {
-  const openPos = getAllMarkets().filter(m => m.position?.status === "open");
-  if (openPos.length === 0) return 0;
+  await syncBalance();
+  let closed = 0;
 
-  let balance   = state.balance;
-  let closedCnt = 0;
-  const clobClient = getClobClient();
+  for (const market of getAllMarkets()) {
+    if (!marketHasExposure(market) && !marketHasActiveOrder(market)) continue;
+    const before = market.position;
+    let nextMarket = market;
 
-  for (const mkt of openPos) {
-    const pos = mkt.position!;
-    const mid = pos.market_id;
-
-    let currentPrice: number | null = null;
-    try {
-      const { data: mdata } = await axios.get(
-        `https://gamma-api.polymarket.com/markets/${mid}`,
-        { timeout: 5000 }
-      );
-      if (mdata.bestBid != null) currentPrice = Number(mdata.bestBid);
-    } catch { /* ignore */ }
-
-    if (currentPrice == null) {
-      for (const o of (mkt.all_outcomes || [])) {
-        if (o.market_id === mid) { currentPrice = o.bid ?? o.price; break; }
-      }
+    if (nextMarket.position) {
+      const bestBid = await fetchBestBid(nextMarket.position.market_id);
+      nextMarket = markMarketPrice(nextMarket, bestBid);
     }
 
-    if (currentPrice == null) continue;
+    nextMarket = await syncMarketExecution(nextMarket);
+    closed += countPositionClosedTransition(before, nextMarket.position);
 
-    const entry    = pos.entry_price;
-    const stop     = pos.stop_price ?? entry * 0.80;
-    const cityName = LOCATIONS[mkt.city]?.name || mkt.city;
+    const currentBid = nextMarket.position ? nextMarket.position.exit.mark_price : null;
+    const { market: marketWithRules, exitIntent } = evaluateExitIntent(nextMarket, currentBid, null);
+    nextMarket = marketWithRules;
 
-    const hoursLeft = mkt.event_end_date ? hoursToResolution(mkt.event_end_date) : 999.0;
-
-    let takeProfit: number | null = null;
-    if (hoursLeft >= 48)      takeProfit = 0.75;
-    else if (hoursLeft >= 24) takeProfit = 0.85;
-
-    if (currentPrice >= entry * 1.20 && stop < entry) {
-      pos.stop_price = entry;
-      pos.trailing_activated = true;
-      console.log(`  [TRAILING] ${cityName} ${mkt.date} — stop moved to breakeven $${entry.toFixed(3)}`);
+    if (exitIntent) {
+      const submitted = await submitSellOrder(nextMarket, exitIntent);
+      nextMarket = submitted.market;
     }
 
-    const takeTriggered = takeProfit != null && currentPrice >= takeProfit;
-    const stopTriggered = currentPrice <= stop;
-
-    if (takeTriggered || stopTriggered) {
-      if (LIVE_TRADING && clobClient && pos.token_id) {
-        await placeLiveOrder(pos.token_id, "SELL", currentPrice, pos.shares, pos.tick_size || "0.01", pos.neg_risk || false);
-      }
-      const pnl = round2((currentPrice - entry) * pos.shares);
-      balance += pos.cost + pnl;
-      pos.closed_at = new Date().toISOString();
-      let reason: string;
-      if (takeTriggered) {
-        pos.close_reason = "take_profit"; reason = "TAKE";
-      } else if (currentPrice < entry) {
-        pos.close_reason = "stop_loss"; reason = "STOP";
-      } else {
-        pos.close_reason = "trailing_stop"; reason = "TRAILING BE";
-      }
-      pos.exit_price = currentPrice;
-      pos.pnl        = pnl;
-      pos.status     = "closed";
-      closedCnt += 1;
-      console.log(`  [${reason}] ${cityName} ${mkt.date} | entry $${entry.toFixed(3)} exit $${currentPrice.toFixed(3)} | ${hoursLeft.toFixed(0)}h left | PnL: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}`);
-      setMarket(mkt);
-    }
+    setMarket(nextMarket);
   }
 
-  if (closedCnt > 0) {
-    state.balance = round2(balance);
-  }
-
-  return closedCnt;
+  recalculateBalances();
+  return closed;
 }

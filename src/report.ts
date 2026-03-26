@@ -5,7 +5,8 @@ import { getState, getAllMarkets } from "./engine.js";
 export function printStatus(): void {
   const state    = getState();
   const markets  = getAllMarkets();
-  const openPos  = markets.filter(m => m.position?.status === "open");
+  const livePos  = markets.filter(m => m.position && m.position.phase !== "closed");
+  const openOrders = markets.flatMap(m => m.orders.filter(order => !order.is_terminal));
   const resolvedM = markets.filter(m => m.status === "resolved" && m.pnl != null);
 
   const bal     = state.balance;
@@ -23,28 +24,25 @@ export function printStatus(): void {
   } else {
     console.log(`  No trades yet`);
   }
-  console.log(`  Open:        ${openPos.length}`);
+  console.log(`  Exposure:    ${livePos.length}`);
+  console.log(`  Open orders: ${openOrders.length}`);
   console.log(`  Resolved:    ${resolvedM.length}`);
+  console.log(`  Available:   $${state.available_balance.toFixed(2)} | Reserved: $${state.reserved_balance.toFixed(2)}`);
 
-  if (openPos.length > 0) {
-    console.log(`\n  Open positions:`);
+  if (livePos.length > 0) {
+    console.log(`\n  Live positions:`);
     let totalUnrealized = 0.0;
-    for (const m of openPos) {
+    for (const m of livePos) {
       const pos     = m.position!;
       const unitSym = m.unit === "F" ? "F" : "C";
       const label   = `${pos.bucket_low}-${pos.bucket_high}${unitSym}`;
-
-      let currentPrice = pos.entry_price;
-      for (const o of (m.all_outcomes || [])) {
-        if (o.market_id === pos.market_id) { currentPrice = o.price; break; }
-      }
-
-      const unrealized = round2((currentPrice - pos.entry_price) * pos.shares);
+      const markPrice = pos.exit.mark_price ?? pos.entry.fill_price;
+      const unrealized = pos.unrealized_pnl ?? 0;
       totalUnrealized += unrealized;
       console.log(
         `    ${m.city_name.padEnd(16)} ${m.date} | ${label.padEnd(14)} | ` +
-        `entry $${pos.entry_price.toFixed(3)} -> $${currentPrice.toFixed(3)} | ` +
-        `PnL: ${unrealized >= 0 ? "+" : ""}${unrealized.toFixed(2)} | ${(pos.forecast_src || "").toUpperCase()}`
+        `entry $${pos.entry.fill_price.toFixed(3)} -> mark $${markPrice.toFixed(3)} | ` +
+        `phase ${pos.phase.padEnd(7)} | U-PnL: ${unrealized >= 0 ? "+" : ""}${unrealized.toFixed(2)} | ${(pos.metrics.forecast_src || "").toUpperCase()}`
       );
     }
     console.log(`\n  Unrealized PnL: ${totalUnrealized >= 0 ? "+" : ""}${totalUnrealized.toFixed(2)}`);
@@ -93,7 +91,9 @@ export function printReport(): void {
     const pnlStr  = m.pnl != null ? `${m.pnl >= 0 ? "+" : ""}${m.pnl.toFixed(2)}` : "-";
     const fcStr   = firstFc != null ? `forecast ${firstFc}->${lastFc}${unitSym}` : "no forecast";
     const actual  = m.actual_temp != null ? `actual ${m.actual_temp}${unitSym}` : "";
-    console.log(`    ${(m.city_name || "").padEnd(16)} ${m.date} | ${label.padEnd(14)} | ${fcStr} | ${actual} | ${result} ${pnlStr}`);
+    const entryFill = pos ? `$${pos.entry.fill_price.toFixed(3)}` : "-";
+    const exitFill = pos?.exit.fill_price != null ? `$${pos.exit.fill_price.toFixed(3)}` : "-";
+    console.log(`    ${(m.city_name || "").padEnd(16)} ${m.date} | ${label.padEnd(14)} | ${fcStr} | ${actual} | entry ${entryFill} exit ${exitFill} | ${result} ${pnlStr}`);
   }
 
   console.log(`${"=".repeat(55)}\n`);
