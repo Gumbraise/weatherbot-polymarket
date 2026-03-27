@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { applyOrderSyncResult, buildOpenPositionFromEntrySignal, markPositionClosing } from "../src/position-state.js";
+import { applyOrderSyncResult, buildOpenPositionFromEntrySignal, markPositionClosing, reconcilePositionToTokenBalance } from "../src/position-state.js";
 import type { EntrySignal, ManagedOrder, Market, OrderSyncResult } from "../src/types.js";
 
 function makeMarket(): Market {
@@ -223,4 +223,45 @@ test("full sell fill closes the position and realizes pnl", () => {
   assert.equal(updated.position?.shares_open, 0);
   assert.equal(updated.position?.realized_pnl, 2.8);
   assert.equal(updated.position?.close_reason, "take_profit");
+});
+
+test("token balance reconciliation closes a stale position when shares are gone", () => {
+  const signal = makeEntrySignal();
+  const basePosition = buildOpenPositionFromEntrySignal(signal, {
+    filled_shares: 20,
+    filled_notional: 8.2,
+    average_price: 0.41,
+    trade_ids: ["t1"],
+    transaction_hashes: [],
+    first_filled_at: "2026-03-26T10:00:00Z",
+    last_filled_at: "2026-03-26T10:00:00Z",
+  }, "2026-03-26T10:00:00Z");
+
+  const reconciled = reconcilePositionToTokenBalance(basePosition, 0, "2026-03-27T09:40:00Z");
+
+  assert.ok(reconciled);
+  assert.equal(reconciled?.phase, "closed");
+  assert.equal(reconciled?.shares_open, 0);
+  assert.equal(reconciled?.shares_closed, 20);
+  assert.equal(reconciled?.close_reason, "manual_exit");
+});
+
+test("token balance reconciliation clamps open shares to the live token balance", () => {
+  const signal = makeEntrySignal();
+  const basePosition = buildOpenPositionFromEntrySignal(signal, {
+    filled_shares: 20,
+    filled_notional: 8.2,
+    average_price: 0.41,
+    trade_ids: ["t1"],
+    transaction_hashes: [],
+    first_filled_at: "2026-03-26T10:00:00Z",
+    last_filled_at: "2026-03-26T10:00:00Z",
+  }, "2026-03-26T10:00:00Z");
+
+  const reconciled = reconcilePositionToTokenBalance(basePosition, 7.5, "2026-03-27T09:40:00Z");
+
+  assert.ok(reconciled);
+  assert.equal(reconciled?.phase, "open");
+  assert.equal(reconciled?.shares_open, 7.5);
+  assert.equal(reconciled?.shares_closed, 12.5);
 });

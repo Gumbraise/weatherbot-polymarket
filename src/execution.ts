@@ -16,8 +16,10 @@ import {
   hasActiveOrder,
   markPositionClosing,
   positionHasExposure,
+  reconcilePositionToTokenBalance,
   updatePositionMark,
 } from "./position-state.js";
+import { getTokenBalance } from "./wallet.js";
 import type {
   CompletedOrder,
   EntrySignal,
@@ -452,13 +454,40 @@ export async function submitBuyOrder(market: Market, signal: EntrySignal): Promi
 }
 
 export async function submitSellOrder(market: Market, exitIntent: ExitIntent): Promise<{ market: Market; submitted: boolean }> {
-  const position = market.position;
+  let position = market.position;
   if (!position || position.phase === "closed" || position.shares_open <= FILL_EPSILON) {
     return { market, submitted: false };
   }
   if (marketHasActiveOrder(market, "SELL")) return { market, submitted: false };
 
   const live = LIVE_TRADING && !!getClobClient();
+  if (live) {
+    const actualShares = await getTokenBalance(position.token_id);
+    const syncedPosition = reconcilePositionToTokenBalance(position, actualShares);
+
+    if (syncedPosition !== position) {
+      if (!syncedPosition || syncedPosition.phase === "closed") {
+        console.log(`  [POSITION SYNC] ${marketName(market)} | token balance is 0.00 shares, closing stale local position`);
+        return {
+          market: {
+            ...market,
+            position: syncedPosition,
+          },
+          submitted: false,
+        };
+      }
+
+      console.log(
+        `  [POSITION SYNC] ${marketName(market)} | adjusted shares from ${position.shares_open.toFixed(2)} to ${syncedPosition.shares_open.toFixed(2)} based on token balance`,
+      );
+      market = {
+        ...market,
+        position: syncedPosition,
+      };
+      position = syncedPosition;
+    }
+  }
+
   const limitPrice = exitIntent.limit_price
     ?? await calculateImmediatePrice(position.token_id, "SELL", position.shares_open)
     ?? exitIntent.signal_price;

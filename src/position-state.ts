@@ -206,6 +206,40 @@ export function clearPendingExitOrder(position: ManagedPosition): ManagedPositio
   return { ...position, pending_exit_order_id: null, last_updated_at: new Date().toISOString() };
 }
 
+export function reconcilePositionToTokenBalance(position: ManagedPosition | null, actualShares: number, syncedAt: string = new Date().toISOString()): ManagedPosition | null {
+  if (!position || position.phase === "closed") return position;
+
+  const normalizedShares = round4(Math.max(0, actualShares));
+  if (Math.abs(position.shares_open - normalizedShares) <= POSITION_EPSILON) return position;
+
+  const sharesClosed = round4(Math.max(position.shares_closed, position.total_entry_shares - normalizedShares));
+  const unrealizedPnl = position.exit.mark_price != null
+    ? round2((position.exit.mark_price - position.average_entry_price) * normalizedShares)
+    : position.unrealized_pnl;
+
+  if (normalizedShares <= POSITION_EPSILON) {
+    return {
+      ...position,
+      phase: "closed" as const,
+      pending_exit_order_id: null,
+      shares_open: 0 as const,
+      shares_closed: sharesClosed,
+      unrealized_pnl: 0,
+      close_reason: (position.close_reason ?? "manual_exit") as CloseReason,
+      closed_at: syncedAt,
+      last_updated_at: syncedAt,
+    };
+  }
+
+  return {
+    ...position,
+    shares_open: normalizedShares,
+    shares_closed: sharesClosed,
+    unrealized_pnl: unrealizedPnl,
+    last_updated_at: syncedAt,
+  };
+}
+
 export function applyOrderSyncResult(market: Market, order: ManagedOrder, sync: OrderSyncResult, entrySignal?: EntrySignal): Market {
   const deltaShares = round4(sync.newly_filled_shares);
   const deltaNotional = round4(sync.total_filled_notional - order.fill.filled_notional);
